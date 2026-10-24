@@ -264,24 +264,26 @@ def evaluate_error_models(table: pd.DataFrame, method: str = "idw", k: int | Non
             "note": "Each station's error is predicted from the other stations only."}
 
 
-@lru_cache(maxsize=16)
-def _error_evaluation_for(path: str, mtime: float, quantity: str = "hourly_temp") -> dict:
+@lru_cache(maxsize=32)
+def _error_evaluation_for(path: str, mtime: float, quantity: str = "hourly_temp",
+                          method: str = "idw") -> dict:
     """evaluate_error_models on the saved table, recomputed only when the file changes."""
-    return evaluate_error_models(load_table(), quantity=quantity)
+    return evaluate_error_models(load_table(), method=method, quantity=quantity)
 
 
 def expected_error_for(method: str, dist_km: float, elev_diff_m: float,
                        disagreement: float | None, quantity: str = "hourly_temp") -> dict | None:
     """Expected error at an orchard from whichever error model won on unseen stations.
 
-    Only for IDW (the disagreement signal is about IDW). Falls back to similar_stations if the
-    winning model can't be used here (e.g. Open-Meteo unreachable, so no disagreement value).
+    The models are scored separately for each method and quantity, so the disagreement signal
+    is only used for a method if it actually predicted that method's error. Falls back to
+    similar_stations if the winning model can't be used here (e.g. no disagreement value).
     """
     table = load_table()
-    if table.empty or method != "idw":
+    if table.empty:
         return None
     ev = _error_evaluation_for(str(config.VALIDATION_TABLE), config.VALIDATION_TABLE.stat().st_mtime,
-                               quantity)
+                               quantity, method)
     if ev.get("status") == "no_validation_table":
         return None
     est = (predict_error(table, ev["best_model"], dist_km, elev_diff_m, disagreement, method, quantity=quantity)
@@ -304,6 +306,111 @@ def expected_error_for(method: str, dist_km: float, elev_diff_m: float,
     if outside:
         est["warning"] = "Outside what we tested, so this error is an extrapolation: " + "; ".join(outside)
     return est
+
+
+# ---------------------------------------------------------------- elevation rule, per metric
+# Chill totals count hours inside temperature bands, so the method with the lowest hourly
+# error is not always the one with the lowest chill error. And where the orchard sits well
+# above or below the nearest station, a fixed lapse rate can go the wrong way (winter
+# inversions) while Open-Meteo models the difference hour by hour. So for each metric we learn
+# one simple rule: "below X m of elevation difference use method A, at or above X use B", and
+# keep it only if it beats the best single method on stations it never saw.
+
+ELEV_THRESHOLDS_M = (25, 50, 75, 100, 125, 150)
+MIN_CASES_PER_SIDE = 3
+
+
+def _abs_err(df: pd.DataFrame, quantity: str, method: str) -> pd.Series:
+    return df[QUANTITIES[quantity][0].format(m=method)].abs()
+
+
+def learn_elevation_rule(table: pd.DataFrame, quantity: str) -> dict | None:
+    """Best threshold and the best method on each side of it, for one metric."""
+    elev = table["nearest_elev_diff_m"].abs()
+    best = None
+    for th in ELEV_THRESHOLDS_M:
+        below, above = table[elev < th], table[elev >= th]
+        if len(below) < MIN_CASES_PER_SIDE or len(above) < MIN_CASES_PER_SIDE:
+            continue
+        m_below = min(METHODS, key=lambda m: _abs_err(below, quantity, m).mean())
+        m_above = min(METHODS, key=lambda m: _abs_err(above, quantity, m).mean())
+        total = (_abs_err(below, quantity, m_below).sum() + _abs_err(above, quantity, m_above).sum()) / len(table)
+        if best is None or total < best["mean_error"]:
+            best = {"threshold_m": th, "below": m_below, "above": m_above, "mean_error": total,
+                    "cases_below": len(below), "cases_above": len(above)}
+    return best
+
+
+def evaluate_elevation_rule(table: pd.DataFrame, quantity: str) -> dict:
+    """Does the elevation rule beat always using one method, on stations it never saw?
+
+    For each station the rule (threshold and both methods) is learned from the OTHER stations,
+    then applied here.
+    """
+    if table.empty or QUANTITIES[quantity][0].format(m="idw") not in table:
+        return {"status": "no_validation_table"}
+    errors, learned = [], []
+    for sid, test in table.groupby("station_id"):
+        rule = learn_elevation_rule(table[table["station_id"] != sid], quantity)
+        if rule is None:
+            continue
+        learned.append((rule["threshold_m"], rule["below"], rule["above"]))
+        for _, r in test.iterrows():
+            m = rule["above"] if abs(r["nearest_elev_diff_m"]) >= rule["threshold_m"] else rule["below"]
+            errors.append(abs(r[QUANTITIES[quantity][0].format(m=m)]))
+    fixed = {m: round(float(_abs_err(table, quantity, m).mean()), 3) for m in METHODS}
+    best_fixed = min(fixed, key=fixed.get)
+    rule_err = round(float(np.mean(errors)), 3)
+    counts = pd.Series([f"<{th} m: {a}, >={th} m: {b}" for th, a, b in learned]).value_counts()
+    return {"quantity": quantity, "unit": QUANTITIES[quantity][1], "cases": len(errors),
+            "elevation_rule_mean_error": rule_err, "always_method_mean_error": fixed,
+            "best_fixed_method": best_fixed, "gain_vs_best_fixed": round(fixed[best_fixed] - rule_err, 3),
+            "passed": rule_err < fixed[best_fixed],
+            "rule_learned_most_often": counts.index[0], "rule_stability": f"{counts.iloc[0]} of {len(learned)}"}
+
+
+@lru_cache(maxsize=16)
+def _elevation_evaluation_for(path: str, mtime: float, quantity: str) -> dict:
+    """evaluate_elevation_rule on the saved table, recomputed only when the file changes."""
+    return evaluate_elevation_rule(load_table(), quantity)
+
+
+def recommend_by_metric(dist_km: float, elev_diff_m: float, disagreement: float | None) -> dict:
+    """Method to use for each metric at this orchard, plus its expected error.
+
+    Uses the elevation rule where it beat the best single method on unseen stations;
+    elsewhere uses that single method. Every choice says why.
+    """
+    table = load_table()
+    if table.empty:
+        return {}
+    mtime = config.VALIDATION_TABLE.stat().st_mtime
+    out = {}
+    for q in QUANTITIES:
+        ev = _elevation_evaluation_for(str(config.VALIDATION_TABLE), mtime, q)
+        if ev.get("status") == "no_validation_table":
+            continue
+        if ev["passed"]:
+            rule = learn_elevation_rule(table, q)
+            side = "above" if abs(elev_diff_m) >= rule["threshold_m"] else "below"
+            method = rule[side]
+            reason = (f"Elevation difference {abs(elev_diff_m):.0f} m is "
+                      f"{'at or above' if side == 'above' else 'below'} {rule['threshold_m']} m, "
+                      f"where {method} had the lowest {q} error. This rule beat always using "
+                      f"{ev['best_fixed_method']} on unseen stations ({ev['elevation_rule_mean_error']} vs "
+                      f"{ev['always_method_mean_error'][ev['best_fixed_method']]} {ev['unit']}).")
+            rule_text = f"<{rule['threshold_m']} m: {rule['below']}, >={rule['threshold_m']} m: {rule['above']}"
+        else:
+            method = ev["best_fixed_method"]
+            reason = (f"{method} had the lowest {q} error on unseen stations; switching by elevation "
+                      f"did not beat it ({ev['elevation_rule_mean_error']} vs "
+                      f"{ev['always_method_mean_error'][method]} {ev['unit']}).")
+            rule_text = None
+        out[q] = {"method": method, "reason": reason, "elevation_rule": rule_text,
+                  "expected_error": expected_error_for(method, dist_km, elev_diff_m, disagreement, q),
+                  "check": {k: ev[k] for k in ("elevation_rule_mean_error", "always_method_mean_error",
+                                               "passed", "rule_stability", "cases")}}
+    return out
 
 
 def evaluate_selector(table: pd.DataFrame, k: int | None = None,

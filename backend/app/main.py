@@ -350,6 +350,9 @@ def source(lat: float, lon: float, exclude: list[str] = Query(default=[]),
         "idw_disagreement_C": a["idw_disagreement_C"],
         **choice,
         "expected_error_selected": err,
+        # What to use for each metric (elevation rule where it proved itself on unseen stations).
+        "by_metric": source_select.recommend_by_metric(a["dist_km"], a["elev_diff_m"],
+                                                       a["idw_disagreement_C"]),
         "validation_table": {"rows": len(table),
                              "seasons": sorted(table["season_end"].unique().tolist()) if len(table) else [],
                              "open_meteo_model": config.OPENMETEO_MODEL},
@@ -363,4 +366,6 @@ def source_evaluation(k: int = config.SELECT_K):
     table = source_select.load_table()
     return {"selector": source_select.evaluate_selector(table, k),
             "error_models": {q: source_select.evaluate_error_models(table, k=k, quantity=q)
-                             for q in source_select.QUANTITIES}}
+                             for q in source_select.QUANTITIES},
+            "elevation_rule": {q: source_select.evaluate_elevation_rule(table, q)
+                               for q in source_select.QUANTITIES}}

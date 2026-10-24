@@ -154,7 +154,8 @@ def test_expected_error_falls_back_without_disagreement(monkeypatch, tmp_path):
     without = source_select.expected_error_for("idw", 30, 0, disagreement=None)  # Open-Meteo offline
     assert with_gap["model"].startswith("disagreement")
     assert without["model"] == "similar_stations"
-    assert source_select.expected_error_for("nearest", 30, 0, 1.0) is None  # signal is about IDW only
+    # other methods get their own error model, scored on their own errors
+    assert source_select.expected_error_for("nearest", 30, 0, 1.0)["unit"] == "°C"
 
 
 def test_expected_error_warns_outside_tested_range(monkeypatch, tmp_path):
@@ -204,3 +205,48 @@ def test_estimate_returns_uncertainty(monkeypatch):
         assert u["hourly_temp_mae_C"]["expected"] >= 0
         assert set(u["chill"]) == {"chill_portions", "chill_hours", "utah_units"}
         assert u["inputs"]["nearest_station"] != "12"
+
+
+def make_elevation_table() -> pd.DataFrame:
+    """Flat stations: nearest has the smallest chill error. Big elevation gaps: corrected wins."""
+    rows = []
+    for i in range(16):
+        high = i >= 10
+        cp = ({"nearest": 4.0, "idw": 5.0, "open_meteo": 7.0, "open_meteo_corrected": 1.5} if high else
+              {"nearest": 1.5, "idw": 2.5, "open_meteo": 5.0, "open_meteo_corrected": 3.0})
+        rows.append({
+            "station_id": f"E{i}", "name": f"E{i}", "season_end": "2025-02-28",
+            "nearest_dist_km": 20 + i, "nearest_elev_diff_m": (150 + i) if high else (5 + i),
+            "best_method_by_mae": "idw", "idw_disagreement_C": 0.5,
+            **{f"mae_C_{m}": 1.0 for m in METHODS},
+            **{f"chill_portions_error_{m}": v * (-1) ** i for m, v in cp.items()},
+            **{f"chill_hours_error_{m}": 10.0 for m in METHODS},
+            **{f"utah_units_error_{m}": 10.0 for m in METHODS},
+        })
+    return pd.DataFrame(rows)
+
+
+def test_learns_elevation_rule():
+    rule = source_select.learn_elevation_rule(make_elevation_table(), "chill_portions")
+    assert rule["below"] == "nearest" and rule["above"] == "open_meteo_corrected"
+    assert 15 < rule["threshold_m"] <= 150
+
+
+def test_elevation_rule_beats_single_method_on_unseen_stations():
+    ev = source_select.evaluate_elevation_rule(make_elevation_table(), "chill_portions")
+    assert ev["passed"] is True and ev["gain_vs_best_fixed"] > 0
+
+
+def test_recommend_by_metric_switches_with_elevation(monkeypatch, tmp_path):
+    path = tmp_path / "loso.csv"
+    make_elevation_table().to_csv(path, index=False)
+    monkeypatch.setattr(config, "VALIDATION_TABLE", path)
+    for f in (source_select._elevation_evaluation_for, source_select._error_evaluation_for):
+        f.cache_clear()
+    flat = source_select.recommend_by_metric(25, 10, 0.5)
+    hill = source_select.recommend_by_metric(25, -180, 0.5)  # orchard 180 m above the station
+    assert flat["chill_portions"]["method"] == "nearest"
+    assert hill["chill_portions"]["method"] == "open_meteo_corrected"
+    assert hill["chill_portions"]["expected_error"]["unit"] == "portions"
+    # where all methods tie, the rule can't beat a single method, so no switching
+    assert flat["chill_hours"]["elevation_rule"] is None
