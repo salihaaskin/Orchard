@@ -71,6 +71,8 @@ backend/   FastAPI
   app/openmeteo_hist.py  Open-Meteo past hourly temperatures (ERA5-Land), cached
   app/source_compare.py  scores nearest station vs IDW vs Open-Meteo against a real station
   app/source_select.py   picks the source per orchard from validation results, with expected error
+  app/sensor_health.py   detects faulty sensor stretches and repairs them (anchored IDW, then anchored Open-Meteo, then linear)
+  scripts/sensor_fill_experiment.py, scripts/sensor_detection_experiment.py  evidence for the fill order and alarm thresholds
   scripts/build_validation_table.py  rebuilds data/validation/loso_table.csv (python -m scripts.build_validation_table)
   app/seasons.py   season windows (chill from Nov 1, GDD from Mar 1)
   app/main.py      API: /estimate, /validate, /stations, /demo, /health
@@ -81,6 +83,7 @@ data/cache/  cached station data (git-ignored, shared into Docker as a volume)
 | Endpoint | What it answers |
 | --- | --- |
 | `GET /estimate?lat=&lon=&as_of=&crop=&exclude=` | Questions 1–3 for any point. Chill (so far, past seasons, projection) uses the method `/source` recommends for chill portions at this orchard (`chill.method`, e.g. nearest station on flat ground, corrected Open-Meteo at 50+ m elevation difference); GDD uses IDW. `uncertainty` gives the expected error (± and ~80% range) of the hourly temperature and each chill total, from stations we hid and estimated |
+| `GET /sensor/health?station_id=&as_of=&simulate=` | Is this station's sensor working? Faulty stretches (long gaps, impossible values, stuck readings while neighbors move, spikes, day-long drift) with reasons, and the record repaired with anchored IDW; `simulate=stuck|drift|spike|missing` plants a fault for a demo |
 | `GET /validate?station_id=&as_of=` | Hide a station, estimate it, report error with and without the elevation adjustment; `method_comparison` scores nearest station vs IDW vs Open-Meteo (MAE, RMSE, bias, % within ±2 °C, chill/GDD error) on the same hours |
 | `GET /validate/all?lat=&lon=&radius_km=&max_stations=` | Same comparison for every active station near a point, grouped by distance to the nearest station |
 | `GET /source?lat=&lon=` | Source Selection Engine: which method to trust at this orchard and the error to expect, from similar stations in `data/validation/loso_table.csv`; `by_metric` picks a method per metric with an elevation rule (e.g. chill portions: nearest station below 50 m elevation difference, corrected Open-Meteo at or above) where that rule beat every single method on unseen stations |

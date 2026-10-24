@@ -81,15 +81,14 @@ def disagreement_c(idw: pd.Series, om_idw: pd.Series) -> float | None:
     return round(float((both["o"] - both["i"]).abs().mean() * 5 / 9), 3)
 
 
-def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], station_id: str,
-                    start, end, crop: str = "almond") -> dict:
-    """Hide station_id and score each of METHODS against its real readings.
+def build_estimates(stations: pd.DataFrame, hourly: dict[str, pd.Series], station_id: str,
+                    start, end) -> tuple[dict[str, pd.Series], pd.DataFrame, pd.Series | None, pd.Series]:
+    """Estimate station_id's hourly °F from everything except its own readings, by each method.
 
-    hourly: station_id -> hourly °F series for the target and its neighbors (from data.py).
-    Returns per-method hourly errors, season-total errors (chill, GDD), and the winner by MAE.
+    Returns (estimates by method, neighbors used, nearest neighbor row or None, Open-Meteo here).
+    Used by validation (hide the whole station) and by sensor_health (fill a broken stretch).
     """
     target = stations.set_index("station_id").loc[station_id]
-    actual = hourly[station_id]
     # Neighbors come only from stations that actually have data this window: closed stations
     # still sit in the CIMIS list and would otherwise leave nearest/IDW with nothing to use.
     has_data = [s for s, v in hourly.items() if not v.dropna().empty]
@@ -110,6 +109,19 @@ def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], statio
                                                 elev_m=nearest_row.elev_m)
         # hour by hour: real reading over there + (model here - model over there)
         estimates["open_meteo_corrected"] = estimates["nearest"] + (om_target - om_near)
+    return estimates, neigh, nearest_row, om_target
+
+
+def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], station_id: str,
+                    start, end, crop: str = "almond") -> dict:
+    """Hide station_id and score each of METHODS against its real readings.
+
+    hourly: station_id -> hourly °F series for the target and its neighbors (from data.py).
+    Returns per-method hourly errors, season-total errors (chill, GDD), and the winner by MAE.
+    """
+    target = stations.set_index("station_id").loc[station_id]
+    actual = hourly[station_id]
+    estimates, neigh, nearest_row, om_target = build_estimates(stations, hourly, station_id, start, end)
     idw_gap = (disagreement_c(estimates["idw"], om_guided_idw(hourly, neigh, om_target, start, end))
                if not om_target.empty else None)
 

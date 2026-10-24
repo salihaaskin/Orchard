@@ -58,6 +58,24 @@ SELECT_MIN_MARGIN_C = float(os.getenv("SELECT_MIN_MARGIN_C", 0.15))
 # Gaps up to this many hours are filled by linear interpolation; longer gaps stay missing.
 MAX_FILL_HOURS = 3
 
+# Sensor health checks (sensor_health.py). "Reference" = the estimate from neighbors, which
+# doesn't use the station itself. Thresholds were checked against healthy CIMIS records.
+SENSOR_RANGE_F = (-10.0, 125.0)      # outside this is not a real California air temperature
+SENSOR_STUCK_HOURS = 6               # identical readings this long... (healthy max seen: 7, once)
+SENSOR_STUCK_REF_RANGE_C = 2.0       # ...while the reference moves at least this much = stuck
+SENSOR_SPIKE_F = 15.0                # one-hour jump this big while the reference stays put
+# Drift: the station's usual difference from the reference (median of the past week) is taken
+# out first, then a day-long average change bigger than this is flagged. On 68 healthy
+# station-seasons this gave ~0.5 alarms per season and caught 67 of 68 planted +6 °C drifts.
+SENSOR_BASELINE_DAYS = 7
+SENSOR_DEVIATION_HOURS = 24
+SENSOR_DEVIATION_C = float(os.getenv("SENSOR_DEVIATION_C", 4.0))
+# Alarms are "low confidence" when the nearest neighbor (the reference) is farther than this.
+SENSOR_REFERENCE_MAX_KM = 50.0
+# Replace faulty hours with an estimate in /estimate? Off by default: the team rule is that
+# gaps longer than MAX_FILL_HOURS stay missing. /sensor/health always shows the repair.
+SENSOR_REPAIR = os.getenv("SENSOR_REPAIR", "false").lower() == "true"
+
 # Preset demo orchards. Coordinates are placeholders until the team picks real spots.
 DEMO_ORCHARDS = {
     "durham": {

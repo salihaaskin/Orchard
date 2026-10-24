@@ -14,8 +14,8 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 
-from . import (chill, config, data, forecast, interp, openmeteo_hist, seasons, source_compare,
-               source_select)
+from . import (chill, config, data, forecast, interp, openmeteo_hist, seasons, sensor_health,
+               source_compare, source_select)
 
 app = FastAPI(title="Chill at My Orchard", version="0.1.0")
 METRICS = ("chill_portions", "chill_hours", "hours_lt_45", "utah_units")
@@ -54,17 +54,25 @@ def estimate_at(lat, lon, elev, start, end, exclude) -> tuple[pd.Series, pd.Data
     return interp.estimate_series(hourly, neigh, elev), neigh
 
 
-def nearest_with_data(lat, lon, start, end, exclude) -> tuple[pd.Series, pd.Series | None]:
-    """Hourly °F of the closest station that has data in start..end, and its station row."""
+def nearest_with_data(lat, lon, start, end, exclude,
+                      repaired: dict[str, pd.Series] | None = None) -> tuple[pd.Series, pd.Series | None]:
+    """Hourly °F of the closest station that has data in start..end, and its station row.
+
+    repaired: station_id -> record with faulty hours replaced (sensor_health.repair), used
+    instead of the raw record for that station.
+    """
     stations = data.get_stations()
     for _, row in interp.nearest(stations, lat, lon, 3 * config.NEIGHBORS, exclude=exclude).iterrows():
-        s = load_hourly([row.station_id], start, end).get(row.station_id)
+        s = (repaired or {}).get(row.station_id)
+        if s is None:
+            s = load_hourly([row.station_id], start, end).get(row.station_id)
         if s is not None and s.notna().any():
             return s, row
     return pd.Series(dtype=float), None
 
 
-def method_series(method: str, lat, lon, elev, start, end, exclude) -> tuple[pd.Series, dict]:
+def method_series(method: str, lat, lon, elev, start, end, exclude,
+                  repaired: dict[str, pd.Series] | None = None) -> tuple[pd.Series, dict]:
     """Hourly °F at the orchard from one of source_compare.METHODS, plus notes on how it was built.
 
     open_meteo_corrected = nearest station reading + (Open-Meteo here - Open-Meteo at that station).
@@ -77,7 +85,7 @@ def method_series(method: str, lat, lon, elev, start, end, exclude) -> tuple[pd.
     if method == "open_meteo":
         return openmeteo_hist.hourly_archive(lat, lon, start, end, elev_m=elev), info
 
-    near, row = nearest_with_data(lat, lon, start, end, exclude)
+    near, row = nearest_with_data(lat, lon, start, end, exclude, repaired)
     if row is None:
         return pd.Series(dtype=float), info
     info["station_id"] = row.station_id
@@ -93,6 +101,76 @@ def method_series(method: str, lat, lon, elev, start, end, exclude) -> tuple[pd.
     est = corrected.combine_first(idw)
     info["hours_from_idw_fallback"] = int((est.notna() & corrected.reindex(est.index).isna()).sum())
     return est, info
+
+
+def station_health(station_id: str, start: date, end: date,
+                   simulate: str | None = None, simulate_start: datetime | None = None,
+                   simulate_hours: int = 8) -> tuple[dict, pd.Series | None]:
+    """Check one station's record for faults over start..end and build a repaired record.
+
+    The reference for the checks is IDW from the station's neighbors (never the station itself).
+    simulate: plant a made-up fault first (stuck, drift, spike, missing) to show it being caught
+    and repaired; the report then compares the repair with the real readings that were hidden.
+    Returns (report for the API, repaired hourly °F or None if the station has no data).
+    """
+    stations_df = data.get_stations()
+    t = stations_df.set_index("station_id").loc[station_id]
+    raw = data.get_hourly(station_id, start, end)
+    if raw.empty or raw["temp_F"].isna().all():
+        return {"station_id": station_id, "status": "no_data",
+                "message": f"No readings from station {station_id} in {start}..{end}."}, None
+    raw = raw.set_index("datetime")
+    truth = raw["temp_F"].copy()
+    planted = None
+    if simulate:
+        at = pd.Timestamp(simulate_start) if simulate_start else raw.index[len(raw) // 2]
+        broken, planted = sensor_health.plant_fault(truth, simulate, at, simulate_hours)
+        raw = raw.assign(temp_F=broken)
+    pool = interp.nearest(stations_df, t.lat, t.lon, 3 * config.NEIGHBORS, exclude=[station_id])
+    hourly = load_hourly(list(pool["station_id"]) + [station_id], start, end)
+    estimates, neigh, *_ = source_compare.build_estimates(stations_df, hourly, station_id, start, end)
+    found = sensor_health.detect_faults(raw["temp_F"], estimates["idw"], raw["is_filled"])
+    fixed, source = sensor_health.repair(raw["temp_F"], found["faulty"], estimates)
+
+    as_reported = chill.summarize(raw["temp_F"])
+    repaired = chill.summarize(fixed)
+    # With far neighbors the reference itself is rough, so drift/stuck alarms are less certain
+    # (in our test the station with a 67 km nearest neighbor drew most of the alarms).
+    nearest_km = float(neigh["dist_km"].iloc[0]) if not neigh.empty else None
+    confidence = "high" if nearest_km is not None and nearest_km <= config.SENSOR_REFERENCE_MAX_KM else "low"
+    report = {
+        "station_id": station_id, "name": t.get("name"), "window": f"{start} to {end}",
+        "status": "alert" if found["episodes"] else "ok",
+        "alert_confidence": confidence,
+        "episodes": found["episodes"],
+        "notes": found["notes"],
+        "faulty_hours": int(found["faulty"].sum()),
+        "repair": {
+            "hours_by_source": source.value_counts().to_dict(),
+            "hours_unfillable": int(fixed.isna().sum()),
+            "order_tried": list(sensor_health.REPAIR_ORDER),
+            "why_this_order": ("Hiding real readings for 3-24 h, anchored IDW was closest at every "
+                               "length; see data/validation/fill_experiment.csv."),
+        },
+        "chill_as_reported": {m: round(as_reported[m], 1) for m in METRICS},
+        "chill_repaired": {m: round(repaired[m], 1) for m in METRICS},
+        **({"simulation": _simulation_summary(simulate, planted, truth, raw["temp_F"], fixed,
+                                              found["faulty"])} if simulate else {}),
+        "reference": {"method": "idw", "neighbors": list(neigh["station_id"]),
+                      "nearest_neighbor_km": round(nearest_km, 1) if nearest_km is not None else None},
+    }
+    return report, fixed
+
+
+def _simulation_summary(kind, hours, truth, broken, fixed, faulty) -> dict:
+    """How the planted fault was handled: caught? and how close the repair came to the truth."""
+    err = lambda s: round(float(((s.reindex(hours) - truth.reindex(hours)).abs() * 5 / 9).mean()), 2)  # noqa: E731
+    return {"fault": kind, "start": str(hours[0]), "hours": len(hours),
+            "caught": bool(faulty.reindex(hours).fillna(False).any()),
+            "error_of_broken_readings_C": None if kind == "missing" else err(broken),
+            "error_after_repair_C": err(fixed),
+            "chill_hours_true_vs_repaired": [float(chill.chill_hours(truth.reindex(hours))[-1]),
+                                             float(chill.chill_hours(fixed.reindex(hours))[-1])]}
 
 
 # ---------------------------------------------------------------- endpoints
@@ -148,6 +226,19 @@ def estimate(
         est, built = method_series("idw", lat, lon, elev, c_start, c_end, exclude)
     if est.dropna().empty:
         raise HTTPException(404, "No station data near this point for this season")
+    # If chill leans on one station (nearest / corrected Open-Meteo), check that station's health.
+    sensor_alerts = None
+    if built.get("station_id"):
+        report, fixed = station_health(built["station_id"], c_start, c_end)
+        sensor_alerts = {k: report[k] for k in ("station_id", "status", "alert_confidence", "faulty_hours", "episodes")
+                         if k in report}
+        sensor_alerts["repaired_in_this_estimate"] = False
+        if (config.SENSOR_REPAIR and fixed is not None and report.get("faulty_hours")
+                and report.get("alert_confidence") == "high"):  # don't rewrite data on a shaky alarm
+            est, built = method_series(chill_method, lat, lon, elev, c_start, c_end, exclude,
+                                       repaired={built["station_id"]: fixed})
+            sensor_alerts["repaired_in_this_estimate"] = True
+            sensor_alerts["repair_hours_by_source"] = report["repair"]["hours_by_source"]
     est = clip(est, c_start, c_end)
     so_far = chill.summarize(est, crop, custom_range=(range_low_f, range_high_f))
 
@@ -222,11 +313,33 @@ def estimate(
         "history": {"seasons": history, "percentiles": pct},
         "projection": projection,
         "uncertainty": uncertainty,
+        "sensor_alerts": sensor_alerts,
         "method_by_metric": {q: {k: r[k] for k in ("method", "elevation_rule", "reason")}
                              for q, r in by_metric.items()},
         "neighbors": neigh[["station_id", "name", "dist_km", "elev_m"]].round(1).to_dict("records"),
         "excluded": exclude,
     }
+
+
+@app.get("/sensor/health")
+def sensor_health_endpoint(station_id: str, as_of: date = Query(default_factory=date.today),
+                           simulate: str | None = None, simulate_start: datetime | None = None,
+                           simulate_hours: int = 8):
+    """Is this station's sensor working? Faulty stretches with reasons, and the repaired record.
+
+    Checks the chill season up to as_of: long gaps, impossible values, stuck readings (only when
+    neighbors moved meanwhile), one-hour spikes, and day-long drift from its neighbors.
+    Demo: simulate=stuck|drift|spike|missing plants a fault (at simulate_start, for
+    simulate_hours) and reports whether it was caught and how close the repair came.
+    """
+    if simulate and simulate not in sensor_health.FAULT_KINDS:
+        raise HTTPException(400, f"simulate must be one of {sensor_health.FAULT_KINDS}")
+    stations_df = data.get_stations()
+    if station_id not in set(stations_df["station_id"]):
+        raise HTTPException(404, f"Unknown station {station_id}")
+    c_start, c_end, _ = seasons.chill_window(as_of)
+    report, _ = station_health(station_id, c_start, c_end, simulate, simulate_start, simulate_hours)
+    return report
 
 
 @app.get("/validate")
