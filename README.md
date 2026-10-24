@@ -58,6 +58,17 @@ cd frontend && streamlit run app.py
 
 Docker files are kept in the repo as an optional alternative (`docker compose up --build`), but the team runs without it.
 
+## Public demo (one container)
+
+The root `Dockerfile` runs the API and the Streamlit app together, so a host gives one public link.
+It ships `data/demo_cache/` (a snapshot of cached CIMIS and Open-Meteo data) so the demo orchards,
+validation regions and sensor demo load fast and work without a CIMIS key; set `CIMIS_APP_KEY`
+as a host secret for other points.
+
+- **Hugging Face Spaces:** new Space, SDK "Docker", push this repo to it (app port 7860).
+- **Render:** New > Blueprint > this repo (`render.yaml`). Free plan sleeps after 15 minutes idle.
+- **Locally:** `docker build -t orchid-demo .` then `docker run -p 7860:7860 orchid-demo`, open http://localhost:7860
+
 ## How it's built
 
 ```

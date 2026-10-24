@@ -1,0 +1,9 @@
+# Never put secrets or local-only files in the image.
+.env
+.git
+.venv
+venv
+.claude
+**/__pycache__
+**/.pytest_cache
+data/cache

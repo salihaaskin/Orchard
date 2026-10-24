@@ -1,0 +1,15 @@
+# Render blueprint: one web service built from the root Dockerfile (API + Streamlit app).
+# In Render: New > Blueprint > pick this repo. Add CIMIS_APP_KEY in the dashboard if you want
+# points beyond the demo snapshot; the demo orchards work without it.
+services:
+  - type: web
+    name: orchid
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: DATA_SOURCE
+        value: cimis
+      - key: CIMIS_APP_KEY
+        sync: false
