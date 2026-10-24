@@ -14,8 +14,8 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 
-from . import (chill, config, data, forecast, interp, openmeteo_hist, seasons, sensor_health,
-               source_compare, source_select)
+from . import (chill, config, data, evidence, forecast, interp, openmeteo_hist, seasons,
+               sensor_health, source_compare, source_select)
 
 app = FastAPI(title="Chill at My Orchard", version="0.1.0")
 METRICS = ("chill_portions", "chill_hours", "hours_lt_45", "utah_units")
@@ -329,6 +329,13 @@ def estimate(
         "neighbors": neigh[["station_id", "name", "dist_km", "elev_m"]].round(1).to_dict("records"),
         "excluded": exclude,
     }
+
+
+@app.get("/evidence")
+def evidence_endpoint():
+    """Everything we measured (hidden-station tests, elevation rule, error bars, sensor tests),
+    summarized for the "How we know" page."""
+    return evidence.evidence()
 
 
 @app.get("/sensor/health")

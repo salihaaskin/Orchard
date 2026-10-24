@@ -35,6 +35,8 @@ def get(path, **params):
 # ---------------------------------------------------------------- pick a place
 st.title("Chill at My Orchard")
 st.caption("Chill and growing degree days for your own orchard, even where the weather station is far away or gone.")
+st.page_link("pages/1_How_we_know.py", label="How we know these numbers are right: we hid 34 real stations and "
+             "measured our error", icon="🔍")
 
 demo = get("/demo")
 if "pin" not in st.session_state:
