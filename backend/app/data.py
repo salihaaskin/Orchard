@@ -15,7 +15,13 @@ import requests
 
 from . import config
 
-CIMIS_BASE = "https://et.water.ca.gov/api"
+CIMIS_BASE = "https://et.water.ca.gov/StationWeb"
+
+def cimis_headers():
+    return {
+        "Ocp-Apim-Subscription-Key": config.CIMIS_APP_KEY,
+        "Accept": "application/json"
+    }
 CONTRACT = ["station_id", "lat", "lon", "elev_m", "datetime", "temp_F", "source", "is_filled"]
 
 
@@ -34,7 +40,11 @@ def get_stations() -> pd.DataFrame:
     cache = config.CACHE_DIR / "stations.parquet"
     if cache.exists():
         return pd.read_parquet(cache)
-    r = requests.get(f"{CIMIS_BASE}/station", headers={"Accept": "application/json"}, timeout=30)
+    r = requests.get(
+    f"{CIMIS_BASE}/GetAllStations",
+    headers=cimis_headers(),
+    timeout=30
+)
     r.raise_for_status()
     rows = []
     for s in r.json()["Stations"]:
@@ -69,33 +79,68 @@ def get_hourly(station_id: str, start: date, end: date) -> pd.DataFrame:
 
 
 def _cimis_hourly(station_id: str, start: date, end: date) -> pd.DataFrame:
-    """One station, one season per request: CIMIS refuses very large requests."""
+    """Fetch real hourly air temperature from CIMIS."""
+
     if not config.CIMIS_APP_KEY:
-        raise RuntimeError("Set CIMIS_APP_KEY in .env, or use DATA_SOURCE=synthetic")
+        raise RuntimeError("CIMIS_APP_KEY is missing")
+
     params = {
-        "appKey": config.CIMIS_APP_KEY, "targets": station_id,
-        "startDate": str(start), "endDate": str(end),
-        "dataItems": "hly-air-tmp", "unitOfMeasure": "E",
+        "stationNbrs": station_id,
+        "startDate": str(start),
+        "endDate": str(end),
+        "isHourly": "true",
+        "unitOfMeasure": "E",
+        "dataItems": "hly-air-tmp",
     }
-    r = requests.get(f"{CIMIS_BASE}/data", params=params,
-                     headers={"Accept": "application/json"}, timeout=120)
+
+    r = requests.get(
+        f"{CIMIS_BASE}/GetDataByStationNumber",
+        params=params,
+        headers=cimis_headers(),
+        timeout=120,
+    )
+
     r.raise_for_status()
+
+    if "json" not in r.headers.get("Content-Type", "").lower():
+        raise RuntimeError(
+            f"CIMIS returned non-JSON response: {r.text[:200]}"
+        )
+
     records = []
+
     for provider in r.json()["Data"]["Providers"]:
         records.extend(provider.get("Records", []))
-    st = get_stations().set_index("station_id").loc[station_id]
-    rows = []
-    for rec in records:
-        hour = int(rec["Hour"]) // 100  # "0100".."2400", hour ending
-        ts = pd.Timestamp(rec["Date"]) + pd.Timedelta(hours=hour)
-        val = (rec.get("HlyAirTmp") or {}).get("Value")
-        rows.append({"datetime": ts, "temp_F": float(val) if val not in (None, "") else np.nan})
-    if not rows:  # e.g. an inactive station after it closed
+
+    if not records:
         return pd.DataFrame(columns=CONTRACT)
-    df = pd.DataFrame(rows)
-    df["station_id"], df["lat"], df["lon"], df["elev_m"] = station_id, st.lat, st.lon, st.elev_m
-    df["source"], df["is_filled"] = "cimis", False
-    return df[CONTRACT]
+
+    st = get_stations().set_index("station_id").loc[station_id]
+
+    rows = []
+
+    for rec in records:
+        hour = int(rec["Hour"]) // 100
+
+        ts = (
+            pd.Timestamp(rec["Date"])
+            + pd.Timedelta(hours=hour)
+        )
+
+        val = (rec.get("HlyAirTmp") or {}).get("Value")
+
+        rows.append({
+            "station_id": station_id,
+            "lat": st.lat,
+            "lon": st.lon,
+            "elev_m": st.elev_m,
+            "datetime": ts,
+            "temp_F": float(val) if val not in (None, "") else np.nan,
+            "source": "cimis",
+            "is_filled": False,
+        })
+
+    return pd.DataFrame(rows)[CONTRACT]
 
 
 def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
