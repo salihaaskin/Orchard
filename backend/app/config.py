@@ -47,6 +47,14 @@ OPENMETEO_MODEL = os.getenv("OPENMETEO_MODEL", "era5_land")
 # Validation reports the share of hours an estimate lands within this many °C of the station.
 WITHIN_C = 2.0
 
+# Source selection: leave-one-station-out results it learns from (built by
+# backend/scripts/build_validation_table.py), and how many similar cases it averages.
+VALIDATION_TABLE = DATA_DIR / "validation" / "loso_table.csv"
+SELECT_K = int(os.getenv("SELECT_K", 7))
+# Switch away from the usual best method only if another one won by at least this much (°C)
+# at the similar stations (smaller differences over a handful of stations are mostly noise).
+SELECT_MIN_MARGIN_C = float(os.getenv("SELECT_MIN_MARGIN_C", 0.15))
+
 # Gaps up to this many hours are filled by linear interpolation; longer gaps stay missing.
 MAX_FILL_HOURS = 3
 

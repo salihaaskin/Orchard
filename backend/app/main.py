@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 
-from . import chill, config, data, forecast, interp, seasons, source_compare
+from . import chill, config, data, forecast, interp, seasons, source_compare, source_select
 
 app = FastAPI(title="Chill at My Orchard", version="0.1.0")
 METRICS = ("chill_portions", "chill_hours", "hours_lt_45", "utah_units")
@@ -241,3 +241,41 @@ def validate_all(
         "data_source": config.DATA_SOURCE,
         "note": "Pilot check over one season; few stations per distance group means weak evidence.",
     }
+
+
+@app.get("/source")
+def source(lat: float, lon: float, exclude: list[str] = Query(default=[])):
+    """Which temperature source to trust at this orchard, and the error to expect.
+
+    Uses distance to the nearest active station and the elevation difference, and looks up
+    which method had the lowest error at similar stations in the validation table.
+    """
+    stations_df = data.get_stations()
+    active = stations_df[stations_df["active"] & ~stations_df["station_id"].isin(exclude)]
+    if active.empty:
+        raise HTTPException(404, "No active stations")
+    near = interp.nearest(active, lat, lon, 1).iloc[0]
+    elev = interp.elevation_m(lat, lon)
+    elev_source = "open-meteo elevation api"
+    if elev is None:  # offline: assume same height as the station, and say so
+        elev, elev_source = float(near.elev_m), "assumed equal to nearest station (offline)"
+    elev_diff = float(near.elev_m) - elev
+
+    table = source_select.load_table()
+    choice = source_select.recommend(float(near.dist_km), elev_diff)
+    return {
+        "location": {"lat": lat, "lon": lon, "elev_m": round(elev, 1), "elev_source": elev_source},
+        "nearest_station": {"station_id": near.station_id, "name": near.get("name"),
+                            "dist_km": round(float(near.dist_km), 1),
+                            "elev_diff_m": round(elev_diff, 1)},
+        **choice,
+        "validation_table": {"rows": len(table),
+                             "seasons": sorted(table["season_end"].unique().tolist()) if len(table) else [],
+                             "open_meteo_model": config.OPENMETEO_MODEL},
+    }
+
+
+@app.get("/source/evaluation")
+def source_evaluation(k: int = config.SELECT_K):
+    """Does picking a source per orchard beat always using one method? (stations it never saw)"""
+    return source_select.evaluate_selector(source_select.load_table(), k)

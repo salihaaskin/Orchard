@@ -70,6 +70,8 @@ backend/   FastAPI
   app/forecast.py  Open-Meteo 14-day forecast, cached for offline demos
   app/openmeteo_hist.py  Open-Meteo past hourly temperatures (ERA5-Land), cached
   app/source_compare.py  scores nearest station vs IDW vs Open-Meteo against a real station
+  app/source_select.py   picks the source per orchard from validation results, with expected error
+  scripts/build_validation_table.py  rebuilds data/validation/loso_table.csv (python -m scripts.build_validation_table)
   app/seasons.py   season windows (chill from Nov 1, GDD from Mar 1)
   app/main.py      API: /estimate, /validate, /stations, /demo, /health
   app/config.py    all shared settings — change values here, not in code
@@ -80,6 +82,9 @@ data/cache/  cached station data (git-ignored, shared into Docker as a volume)
 | --- | --- |
 | `GET /estimate?lat=&lon=&as_of=&crop=&exclude=` | Questions 1–3 for any point |
 | `GET /validate?station_id=&as_of=` | Hide a station, estimate it, report error with and without the elevation adjustment; `method_comparison` scores nearest station vs IDW vs Open-Meteo (MAE, RMSE, bias, % within ±2 °C, chill/GDD error) on the same hours |
+| `GET /validate/all?lat=&lon=&radius_km=&max_stations=` | Same comparison for every active station near a point, grouped by distance to the nearest station |
+| `GET /source?lat=&lon=` | Source Selection Engine: which method to trust at this orchard and the error to expect, from similar stations in `data/validation/loso_table.csv` |
+| `GET /source/evaluation` | Does choosing a method per orchard beat always using one? Tested on stations the selector never saw |
 
 ## Data contract
 
