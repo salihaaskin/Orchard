@@ -45,7 +45,7 @@ def test_validate_scores_three_methods_on_same_hours():
     assert r.status_code == 200, r.text
     c = r.json()["method_comparison"]
     assert c["hours_compared"] > 1000
-    for m in ("nearest", "idw", "open_meteo"):
+    for m in source_compare.METHODS:
         assert c["methods"][m]["available"] is True
         assert c["methods"][m]["hours_compared"] == c["hours_compared"]
         assert "chill_portions" in c["methods"][m]["season_total_error"]
@@ -58,15 +58,19 @@ def test_validate_scores_three_methods_on_same_hours():
 def test_summarize_by_distance_groups_and_counts():
     rows = [
         {"nearest_dist_km": 5.0, "mae_C_nearest": 0.5, "mae_C_idw": 0.6, "mae_C_open_meteo": 1.0,
-         "open_meteo_mae_gain_vs_nearest_C": -0.5},
+         "mae_C_open_meteo_corrected": 0.4, "open_meteo_mae_gain_vs_nearest_C": -0.5,
+         "open_meteo_corrected_mae_gain_vs_nearest_C": 0.1},
         {"nearest_dist_km": 40.0, "mae_C_nearest": 2.0, "mae_C_idw": 1.5, "mae_C_open_meteo": 1.2,
-         "open_meteo_mae_gain_vs_nearest_C": 0.8},
+         "mae_C_open_meteo_corrected": None, "open_meteo_mae_gain_vs_nearest_C": 0.8,
+         "open_meteo_corrected_mae_gain_vs_nearest_C": None},
     ]
     groups = source_compare.summarize_by_distance(rows)
     assert [g["dist_km"] for g in groups] == ["0-15", "30-50"]
     assert groups[0]["open_meteo_beats_nearest"] == 0
     assert groups[1]["open_meteo_beats_nearest"] == 1
     assert groups[1]["mean_mae_C_open_meteo"] == 1.2
+    assert groups[0]["open_meteo_corrected_beats_nearest"] == 1
+    assert groups[1]["mean_mae_C_open_meteo_corrected"] is None
 
 
 def test_validate_all_synthetic():
@@ -91,3 +95,23 @@ def test_neighbor_without_data_is_skipped():
     second = source_compare.compare_methods(stations, hourly, "SYN-B", start, end)
     assert second["methods"]["nearest"]["station"]["station_id"] != closest
     assert second["methods"]["idw"]["available"] is True
+
+
+def test_corrected_is_nearest_plus_model_difference():
+    """open_meteo_corrected = nearest reading + (model at target - model at nearest), hour by hour."""
+    from app import data
+    stations = data.get_stations()
+    start, end = date(2024, 11, 1), date(2024, 11, 30)
+    hourly = {s: data.get_hourly(s, start, end).set_index("datetime")["temp_F"]
+              for s in stations["station_id"]}
+    c = source_compare.compare_methods(stations, hourly, "SYN-B", start, end)
+    by_id = stations.set_index("station_id")
+    near_id = c["methods"]["nearest"]["station"]["station_id"]
+    near, tgt = by_id.loc[near_id], by_id.loc["SYN-B"]
+    om_t = openmeteo_hist.hourly_archive(tgt.lat, tgt.lon, start, end, elev_m=tgt.elev_m)
+    om_n = openmeteo_hist.hourly_archive(near.lat, near.lon, start, end, elev_m=near.elev_m)
+    expected = hourly[near_id] + (om_t - om_n)
+    assert (source_compare.error_metrics(hourly["SYN-B"], expected)["mae_F"]
+            == c["methods"]["open_meteo_corrected"]["mae_F"])
+    # the synthetic model's +1 °F bias is the same at both places, so it cancels out
+    assert abs(c["methods"]["open_meteo_corrected"]["bias_F"]) < abs(c["methods"]["open_meteo"]["bias_F"])

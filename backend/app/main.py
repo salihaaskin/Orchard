@@ -169,7 +169,8 @@ def estimate(
 def validate(station_id: str, as_of: date = Query(default=date(2025, 2, 28))):
     """Hide a station; estimate it from neighbors with and without the elevation adjustment.
 
-    method_comparison also scores nearest station vs IDW vs Open-Meteo on the same hours.
+    method_comparison also scores nearest station, IDW, Open-Meteo and corrected Open-Meteo
+    on the same hours.
     """
     stations_df = data.get_stations()
     if station_id not in set(stations_df["station_id"]):
@@ -233,7 +234,8 @@ def validate_all(
         "open_meteo_model": config.OPENMETEO_MODEL,
         "stations": rows,
         "by_nearest_distance": source_compare.summarize_by_distance(rows),
-        "open_meteo_beats_nearest": sum(1 for r in rows if (r["open_meteo_mae_gain_vs_nearest_C"] or 0) > 0),
+        **{f"{m}_beats_nearest": sum(1 for r in rows if (r[f"{m}_mae_gain_vs_nearest_C"] or 0) > 0)
+           for m in source_compare.OPEN_METEO_METHODS},
         "stations_compared": len(rows),
         "skipped": skipped,
         "data_source": config.DATA_SOURCE,
