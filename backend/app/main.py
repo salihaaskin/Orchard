@@ -159,6 +159,16 @@ def station_health(station_id: str, start: date, end: date,
         "reference": {"method": "idw", "neighbors": list(neigh["station_id"]),
                       "nearest_neighbor_km": round(nearest_km, 1) if nearest_km is not None else None},
     }
+    # A day either side of the simulated fault (or the first alarm), for a chart.
+    focus = planted[0] if planted is not None else (
+        pd.Timestamp(found["episodes"][0]["start"]) if found["episodes"] else None)
+    if focus is not None:
+        span = pd.date_range(focus - pd.Timedelta(hours=24), focus + pd.Timedelta(hours=48), freq="h")
+        as_list = lambda s: [None if pd.isna(v) else round(float(v), 1) for v in s.reindex(span)]  # noqa: E731
+        report["series"] = {"time": [str(x) for x in span], "reported": as_list(raw["temp_F"]),
+                            "repaired": as_list(fixed), "neighbors_idw": as_list(estimates["idw"]),
+                            **({"true": as_list(truth)} if simulate else {}),
+                            "faulty": [bool(v) for v in found["faulty"].reindex(span).fillna(False)]}
     return report, fixed
 
 

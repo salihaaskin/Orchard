@@ -11,6 +11,19 @@ from streamlit_folium import st_folium
 API = os.getenv("BACKEND_URL", "http://localhost:8000")
 st.set_page_config(page_title="Chill at My Orchard", layout="wide")
 
+METHOD_LABELS = {
+    "nearest": "the nearest weather station",
+    "idw": "nearby stations, weighted by distance (IDW)",
+    "open_meteo": "the Open-Meteo weather model",
+    "open_meteo_corrected": "the nearest station, corrected with Open-Meteo for the elevation difference",
+}
+
+
+def with_error(value: float, metric: str, chill_err: dict) -> str:
+    """'59 ± 3' when we know the expected error for this metric, else just the number."""
+    e = chill_err.get(metric)
+    return f"{value:.0f} ± {e['plus_minus']:.0f}" if e else f"{value:.0f}"
+
 
 @st.cache_data(show_spinner=False)
 def get(path, **params):
@@ -66,11 +79,34 @@ if est["data_source"] == "synthetic":
 st.subheader(pin["label"])
 ch, hist, proj = est["chill"], est["history"], est["projection"]
 p = hist["percentiles"].get("chill_portions", {})
+unc = est.get("uncertainty") or {}
+chill_err = unc.get("chill", {}) if unc.get("available") else {}
+
+# Where the temperatures come from, and why (chosen by testing on stations we hid).
+if ch.get("method"):
+    st.markdown(f"**Temperatures from:** {METHOD_LABELS.get(ch['method'], ch['method'])}. "
+                f"<span style='opacity:0.7'>{ch.get('method_reason', '')}</span>", unsafe_allow_html=True)
+
+# Is the station we lean on working?
+alerts = est.get("sensor_alerts") or {}
+if alerts.get("status") == "alert":
+    kinds = ", ".join(sorted({e["type"] for e in alerts.get("episodes", [])}))
+    msg = (f"Station {alerts['station_id']} looks faulty for {alerts['faulty_hours']} hours this season "
+           f"({kinds}).")
+    if alerts.get("repaired_in_this_estimate"):
+        fixed = {k: v for k, v in alerts.get("repair_hours_by_source", {}).items() if k != "sensor"}
+        msg += f" Those hours were replaced with estimates ({', '.join(f'{v} h {k}' for k, v in fixed.items())})."
+    elif alerts.get("alert_confidence") == "low":
+        msg += " Its neighbors are far away, so this alarm is uncertain and the data was not changed."
+    st.warning(msg)
 
 # ---------------------------------------------------------------- the three answers
 a1, a2, a3 = st.columns(3)
-a1.metric("1 · Chill so far (portions)", f"{ch['chill_portions']:.0f}",
-          help=f"Since {ch['start']}. Dynamic model, preferred for California's mild winters.")
+cp_err = chill_err.get("chill_portions")
+a1.metric("1 · Chill so far (portions)", with_error(ch["chill_portions"], "chill_portions", chill_err),
+          help=f"Since {ch['start']}. Dynamic model, preferred for California's mild winters."
+               + (f" Likely error ±{cp_err['plus_minus']:.0f} (range {cp_err['range'][0]:.0f}–"
+                  f"{cp_err['range'][1]:.0f}), from stations we hid and estimated." if cp_err else ""))
 if p:
     a2.metric("2 · vs. a typical year", f"{ch['chill_portions'] - p['p50']:+.0f}",
               help=f"Typical (median) on this date: {p['p50']}. Normal range {p['p10']}–{p['p90']}.")
@@ -80,9 +116,10 @@ if "added" in proj:
 
 cr = ch["custom_range"]
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Chill hours (32–45°F)", f"{ch['chill_hours']:.0f}")
+m1.metric("Chill hours (32–45°F)", with_error(ch["chill_hours"], "chill_hours", chill_err))
 m2.metric("Hours below 45°F", f"{ch['hours_lt_45']:.0f}")
-m3.metric("Utah chill units", f"{ch['utah_units']:.0f}", help="Warm hours subtract units")
+m3.metric("Utah chill units", with_error(ch["utah_units"], "utah_units", chill_err),
+          help="Warm hours subtract units")
 m4.metric("GDD since bloom (°C·days)",
           f"{est['gdd']['total_c_days']:.0f}" if est["gdd"]["started"] else "Not yet",
           help=f"Single sine, 5–35°C, counted from {est['gdd']['start']} (assumed bloom date)")
@@ -92,6 +129,24 @@ st.markdown(f"**Your temperature range, since {ch['start']}:** "
             f"{cr['hours_between']:.0f} hours between {cr['low_f']:.0f} and {cr['high_f']:.0f}°F · "
             f"{cr['hours_above']:.0f} hours above {cr['high_f']:.0f}°F")
 st.caption(f"{ch['hours_missing']} missing hours · elevation {est['location']['elev_m']} m")
+
+if unc.get("available"):
+    with st.expander("How sure are we?"):
+        t = unc["hourly_temp_mae_C"]
+        st.markdown(
+            f"We hid real CIMIS stations, estimated them the same way, and compared. For a spot like "
+            f"this the hourly temperature is typically off by **{t['expected']:.1f} °C** "
+            f"(range {t['range'][0]:.1f}–{t['range'][1]:.1f}). The ± numbers above are the likely error "
+            f"of each chill total so far; the ranges held the real error about 80% of the time.")
+        if unc.get("warning"):
+            st.warning(unc["warning"])
+        st.caption(unc["gdd"])
+        mbm = est.get("method_by_metric") or {}
+        if mbm:
+            st.markdown("**Best source per metric at this orchard** (tested on stations we never used to choose):")
+            for metric, r in mbm.items():
+                rule = f" · rule: {r['elevation_rule']}" if r.get("elevation_rule") else ""
+                st.markdown(f"- {metric.replace('_', ' ')}: {METHOD_LABELS.get(r['method'], r['method'])}{rule}")
 
 # ---------------------------------------------------------------- chart
 fig = go.Figure()

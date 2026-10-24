@@ -127,3 +127,12 @@ def test_estimate_repairs_high_confidence_faults_by_default(monkeypatch):
     assert alerts["repaired_in_this_estimate"] is True
     assert alerts["repair_hours_by_source"]["idw_anchored"] == 5
     assert body["chill"]["method_details"]["station_id"] == calls["station"]
+
+
+def test_simulation_returns_chart_series():
+    body = client.get("/sensor/health", params={"station_id": "SYN-B", "as_of": "2025-01-31",
+                                               "simulate": "drift", "simulate_start": "2025-01-20T06:00",
+                                               "simulate_hours": 24}).json()
+    s = body["series"]
+    assert len(s["time"]) == len(s["reported"]) == len(s["repaired"]) == len(s["true"]) == 73
+    assert any(s["faulty"])
