@@ -53,6 +53,34 @@ def error_metrics(actual_f: pd.Series, predicted_f: pd.Series) -> dict:
     }
 
 
+def om_guided_idw(hourly: dict[str, pd.Series], neighbors: pd.DataFrame, om_target: pd.Series,
+                  start, end) -> pd.Series:
+    """IDW where each neighbor is moved to the target by Open-Meteo's difference, not a lapse rate.
+
+    estimate = weighted sum of (neighbor reading + model at target - model at neighbor), hour by hour.
+    """
+    shifted = {}
+    for _, nb in neighbors.iterrows():
+        if nb.station_id not in hourly:
+            continue
+        om_nb = openmeteo_hist.hourly_archive(nb.lat, nb.lon, start, end, elev_m=nb.elev_m)
+        if not om_nb.empty:
+            shifted[nb.station_id] = hourly[nb.station_id] + (om_target - om_nb)
+    return interp.estimate_series(shifted, neighbors, target_elev_m=0.0, lapse_f_per_m=0.0)
+
+
+def disagreement_c(idw: pd.Series, om_idw: pd.Series) -> float | None:
+    """Average gap (°C) between plain IDW and Open-Meteo-guided IDW over the hours both exist.
+
+    Needs no reading at the target, so it can be computed at any orchard. A big gap means the
+    two ways of moving station readings to this spot disagree: a warning that IDW may be off here.
+    """
+    both = pd.concat([idw.rename("i"), om_idw.rename("o")], axis=1).dropna()
+    if both.empty:
+        return None
+    return round(float((both["o"] - both["i"]).abs().mean() * 5 / 9), 3)
+
+
 def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], station_id: str,
                     start, end, crop: str = "almond") -> dict:
     """Hide station_id and score each of METHODS against its real readings.
@@ -82,6 +110,8 @@ def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], statio
                                                 elev_m=nearest_row.elev_m)
         # hour by hour: real reading over there + (model here - model over there)
         estimates["open_meteo_corrected"] = estimates["nearest"] + (om_target - om_near)
+    idw_gap = (disagreement_c(estimates["idw"], om_guided_idw(hourly, neigh, om_target, start, end))
+               if not om_target.empty else None)
 
     # Same hours for everyone: keep only hours where the station and all estimates exist.
     # An empty estimate (e.g. Open-Meteo unreachable) is left out: it has no dates to line up on.
@@ -126,6 +156,8 @@ def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], statio
         "methods": methods,
         "best_method_by_mae": best,
         **{f"{m}_mae_gain_vs_nearest_F": gains[m] for m in OPEN_METEO_METHODS},
+        # Warning signal computable without a reading here (see disagreement_c).
+        "idw_disagreement_C": idw_gap,
         "note": "One station and one season: a pilot check, not a general accuracy claim.",
     }
 
@@ -141,6 +173,7 @@ def station_row(result: dict) -> dict:
         "nearest_dist_km": near.get("dist_km"),
         "nearest_elev_diff_m": near.get("elev_diff_m"),
         "best_method_by_mae": result["best_method_by_mae"],
+        "idw_disagreement_C": result["idw_disagreement_C"],
     }
     within = f"pct_within_{config.WITHIN_C:g}C"
     for name in METHODS:

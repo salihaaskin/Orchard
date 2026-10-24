@@ -62,11 +62,12 @@ def test_selector_beats_every_fixed_method_on_unseen_stations():
 def test_source_endpoint_without_table(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "VALIDATION_TABLE", tmp_path / "missing.csv")
     monkeypatch.setattr(interp, "elevation_m", lambda lat, lon: 40.0)  # no internet in tests
-    r = client.get("/source", params={"lat": 39.61, "lon": -121.82})
+    r = client.get("/source", params={"lat": 39.61, "lon": -121.82, "exclude": ["12"]})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "no_validation_table"
-    assert body["nearest_station"]["station_id"] != "12"  # Durham is inactive
+    assert body["nearest_station"]["station_id"] != "12"  # excluded, like the Durham demo
+    assert body["idw_disagreement_C"] is not None
 
 
 def test_source_endpoint_with_table(monkeypatch, tmp_path):
@@ -85,7 +86,7 @@ def test_evaluation_endpoint(monkeypatch, tmp_path, k):
     make_table().to_csv(path, index=False)
     monkeypatch.setattr(config, "VALIDATION_TABLE", path)
     ev = client.get("/source/evaluation", params={"k": k}).json()
-    assert ev["cases"] == 10 and ev["stations"] == 10
+    assert ev["selector"]["cases"] == 10 and ev["selector"]["stations"] == 10
 
 
 def _fake_evaluation(gain):
@@ -118,3 +119,50 @@ def test_recommend_keeps_local_choice_when_selector_passed_check(monkeypatch, tm
     c = source_select.recommend(dist_km=62, elev_diff_m=240)
     assert c["selector_check"]["passed"] is True
     assert c["selected_method"] == "open_meteo_corrected"
+
+
+def make_gap_table(n=24) -> pd.DataFrame:
+    """IDW error rises with the IDW-vs-Open-Meteo disagreement: mae = 0.5 + 1.0 * gap (+ small wiggle)."""
+    t = make_table()
+    t = pd.concat([t] * (n // len(t) + 1), ignore_index=True).iloc[:n].copy()
+    t["station_id"] = [f"G{i}" for i in range(n)]
+    t["idw_disagreement_C"] = [0.1 + 0.08 * i for i in range(n)]
+    t["mae_C_idw"] = 0.5 + 1.0 * t["idw_disagreement_C"] + [(-0.03, 0.03)[i % 2] for i in range(n)]
+    return t
+
+
+def test_disagreement_model_recovers_the_line():
+    p = source_select.predict_error(make_gap_table(), "disagreement", 30, 0, disagreement=1.0)
+    assert abs(p["expected_mae_C"] - 1.5) < 0.05
+    assert p["range_mae_C"][0] <= p["expected_mae_C"] <= p["range_mae_C"][1]
+
+
+def test_disagreement_beats_table_average_when_it_carries_signal():
+    ev = source_select.evaluate_error_models(make_gap_table())
+    s = ev["scores"]
+    assert s["disagreement"]["mean_miss_C"] < s["table_average"]["mean_miss_C"]
+    assert ev["best_model"] in ("disagreement", "disagreement+geometry")
+    assert ev["gain_vs_table_average_C"] > 0
+
+
+def test_expected_error_falls_back_without_disagreement(monkeypatch, tmp_path):
+    path = tmp_path / "loso.csv"
+    make_gap_table().to_csv(path, index=False)
+    monkeypatch.setattr(config, "VALIDATION_TABLE", path)
+    source_select._error_evaluation_for.cache_clear()
+    with_gap = source_select.expected_error_for("idw", 30, 0, disagreement=1.0)
+    without = source_select.expected_error_for("idw", 30, 0, disagreement=None)  # Open-Meteo offline
+    assert with_gap["model"].startswith("disagreement")
+    assert without["model"] == "similar_stations"
+    assert source_select.expected_error_for("nearest", 30, 0, 1.0) is None  # signal is about IDW only
+
+
+def test_expected_error_warns_outside_tested_range(monkeypatch, tmp_path):
+    path = tmp_path / "loso.csv"
+    make_gap_table().to_csv(path, index=False)  # distances 10-69 km, disagreement 0.1-1.94 °C
+    monkeypatch.setattr(config, "VALIDATION_TABLE", path)
+    source_select._error_evaluation_for.cache_clear()
+    inside = source_select.expected_error_for("idw", 30, 0, disagreement=1.0)
+    close = source_select.expected_error_for("idw", 3, 0, disagreement=1.0)
+    assert inside["within_tested_range"] is True and "warning" not in inside
+    assert close["within_tested_range"] is False and "km" in close["warning"]

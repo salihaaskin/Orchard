@@ -145,6 +145,144 @@ def recommend(dist_km: float, elev_diff_m: float) -> dict:
     return choice
 
 
+# ---------------------------------------------------------------- how wrong will IDW be here?
+# Three ways to predict the hourly MAE of a method at an orchard, before we have any reading
+# there. evaluate_error_models() scores them on unseen stations; the winner is used in /source.
+
+# table_average is the reference: the same guess everywhere. A model must beat it to be useful.
+ERROR_MODELS = ("table_average", "similar_stations", "disagreement", "disagreement+geometry")
+INTERVAL_Q = (0.1, 0.9)  # the range we report should hold the real error about 80% of the time
+
+
+def _features(df: pd.DataFrame, model: str) -> np.ndarray:
+    """Design matrix (with a constant column) for the linear error models."""
+    cols = [np.ones(len(df)), df["idw_disagreement_C"].to_numpy(float)]
+    if model == "disagreement+geometry":
+        cols += [df["nearest_dist_km"].to_numpy(float) / DIST_SCALE_KM,
+                 df["nearest_elev_diff_m"].abs().to_numpy(float) / ELEV_SCALE_M]
+    return np.column_stack(cols)
+
+
+def predict_error(table: pd.DataFrame, model: str, dist_km: float, elev_diff_m: float,
+                  disagreement: float | None, method: str = "idw", k: int | None = None) -> dict | None:
+    """Expected hourly MAE (°C) of `method` at one orchard, plus an ~80% range.
+
+    similar_stations: average over the k test stations most like this orchard (distance,
+        elevation difference); range = their 10th-90th percentile.
+    disagreement(+geometry): straight-line fit of MAE on the IDW-vs-Open-Meteo gap (and distance,
+        elevation difference); range = prediction + the fit's 10th-90th percentile miss.
+    Returns None if the model can't be used (e.g. no disagreement value).
+    """
+    target = f"mae_C_{method}"
+    if model == "table_average":
+        vals = table[target].dropna()
+        if vals.empty:
+            return None
+        mean, lo, hi = vals.mean(), vals.quantile(INTERVAL_Q[0]), vals.quantile(INTERVAL_Q[1])
+    elif model == "similar_stations":
+        similar = table.assign(gap=_gap(table, dist_km, elev_diff_m)).nsmallest(k or config.SELECT_K, "gap")
+        vals = similar[target].dropna()
+        if vals.empty:
+            return None
+        mean, lo, hi = vals.mean(), vals.quantile(INTERVAL_Q[0]), vals.quantile(INTERVAL_Q[1])
+    else:
+        if disagreement is None or "idw_disagreement_C" not in table:
+            return None
+        train = table.dropna(subset=["idw_disagreement_C", target])
+        if len(train) < 10:
+            return None
+        X, y = _features(train, model), train[target].to_numpy(float)
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        resid = y - X @ coef
+        row = pd.DataFrame({"idw_disagreement_C": [disagreement], "nearest_dist_km": [dist_km],
+                            "nearest_elev_diff_m": [elev_diff_m]})
+        mean = float((_features(row, model) @ coef)[0])
+        lo, hi = mean + np.quantile(resid, INTERVAL_Q[0]), mean + np.quantile(resid, INTERVAL_Q[1])
+    return {"expected_mae_C": round(float(max(mean, 0.0)), 2),
+            "range_mae_C": [round(float(max(lo, 0.0)), 2), round(float(hi), 2)],
+            "model": model}
+
+
+def evaluate_error_models(table: pd.DataFrame, method: str = "idw", k: int | None = None) -> dict:
+    """Which error model best predicts how wrong `method` will be at a station it never saw?
+
+    Nested leave-one-station-out: each station's error is predicted from the other stations only.
+    Scores: average miss of the predicted MAE (lower is better), correlation with the real MAE,
+    and how often the real MAE fell inside the reported range (aim: about 80%).
+    """
+    if table.empty or "idw_disagreement_C" not in table:
+        return {"status": "no_validation_table"}
+    rows = []
+    for sid, test in table.groupby("station_id"):
+        train = table[table["station_id"] != sid]
+        for _, r in test.iterrows():
+            out = {"station_id": sid, "season_end": r["season_end"], "actual": r[f"mae_C_{method}"]}
+            for model in ERROR_MODELS:
+                gap = r["idw_disagreement_C"] if pd.notna(r["idw_disagreement_C"]) else None
+                p = predict_error(train, model, r["nearest_dist_km"], r["nearest_elev_diff_m"], gap, method, k)
+                out[model] = p["expected_mae_C"] if p else np.nan
+                out[f"{model}_in_range"] = (p["range_mae_C"][0] <= r[f"mae_C_{method}"] <= p["range_mae_C"][1]
+                                            if p else np.nan)
+                out[f"{model}_width"] = p["range_mae_C"][1] - p["range_mae_C"][0] if p else np.nan
+            rows.append(out)
+    p = pd.DataFrame(rows).dropna(subset=list(ERROR_MODELS))
+    scores = {}
+    for model in ERROR_MODELS:
+        scores[model] = {
+            "mean_miss_C": round(float((p[model] - p["actual"]).abs().mean()), 3),
+            "correlation": round(float(np.corrcoef(p[model], p["actual"])[0, 1]), 2),
+            "range_coverage_pct": round(float(p[f"{model}_in_range"].astype(float).mean() * 100), 1),
+            "mean_range_width_C": round(float(p[f"{model}_width"].mean()), 2),
+        }
+    best = min(ERROR_MODELS, key=lambda m: scores[m]["mean_miss_C"])
+    return {"method": method, "cases": len(p), "stations": int(p["station_id"].nunique()),
+            "scores": scores, "best_model": best,
+            "gain_vs_table_average_C": round(scores["table_average"]["mean_miss_C"]
+                                             - scores[best]["mean_miss_C"], 3),
+            "note": "Each station's error is predicted from the other stations only."}
+
+
+@lru_cache(maxsize=4)
+def _error_evaluation_for(path: str, mtime: float) -> dict:
+    """evaluate_error_models on the saved table, recomputed only when the file changes."""
+    return evaluate_error_models(load_table())
+
+
+def expected_error_for(method: str, dist_km: float, elev_diff_m: float,
+                       disagreement: float | None) -> dict | None:
+    """Expected error at an orchard from whichever error model won on unseen stations.
+
+    Only for IDW (the disagreement signal is about IDW). Falls back to similar_stations if the
+    winning model can't be used here (e.g. Open-Meteo unreachable, so no disagreement value).
+    """
+    table = load_table()
+    if table.empty or method != "idw":
+        return None
+    ev = _error_evaluation_for(str(config.VALIDATION_TABLE), config.VALIDATION_TABLE.stat().st_mtime)
+    if ev.get("status") == "no_validation_table":
+        return None
+    est = (predict_error(table, ev["best_model"], dist_km, elev_diff_m, disagreement, method)
+           or predict_error(table, "similar_stations", dist_km, elev_diff_m, disagreement, method))
+    est["chosen_because"] = (f"lowest average miss on unseen stations "
+                             f"({ev['scores'][ev['best_model']]['mean_miss_C']} °C, {ev['cases']} cases)")
+    est["evaluation"] = ev["scores"]
+
+    # Our tests only cover what they cover: flag orchards outside that range instead of
+    # quietly extrapolating (e.g. a station 4 km away when every test case was 7+ km).
+    outside = []
+    lo, hi = table["nearest_dist_km"].min(), table["nearest_dist_km"].max()
+    if not lo <= dist_km <= hi:
+        outside.append(f"nearest station {dist_km:.1f} km away; tests covered {lo:.1f}-{hi:.1f} km")
+    if est["model"].startswith("disagreement") and disagreement is not None:
+        glo, ghi = table["idw_disagreement_C"].min(), table["idw_disagreement_C"].max()
+        if not glo <= disagreement <= ghi:
+            outside.append(f"disagreement {disagreement:.2f} °C; tests covered {glo:.2f}-{ghi:.2f} °C")
+    est["within_tested_range"] = not outside
+    if outside:
+        est["warning"] = "Outside what we tested, so this error is an extrapolation: " + "; ".join(outside)
+    return est
+
+
 def evaluate_selector(table: pd.DataFrame, k: int | None = None,
                       min_margin_c: float | None = None) -> dict:
     """Does choosing per orchard beat always using one method? Tested on unseen stations.

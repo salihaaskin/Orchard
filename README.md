@@ -84,7 +84,7 @@ data/cache/  cached station data (git-ignored, shared into Docker as a volume)
 | `GET /validate?station_id=&as_of=` | Hide a station, estimate it, report error with and without the elevation adjustment; `method_comparison` scores nearest station vs IDW vs Open-Meteo (MAE, RMSE, bias, % within ±2 °C, chill/GDD error) on the same hours |
 | `GET /validate/all?lat=&lon=&radius_km=&max_stations=` | Same comparison for every active station near a point, grouped by distance to the nearest station |
 | `GET /source?lat=&lon=` | Source Selection Engine: which method to trust at this orchard and the error to expect, from similar stations in `data/validation/loso_table.csv` |
-| `GET /source/evaluation` | Does choosing a method per orchard beat always using one? Tested on stations the selector never saw |
+| `GET /source/evaluation` | On stations never seen: does choosing a method per orchard beat always using one, and which model best predicts the reported error (the winner uses the IDW-vs-Open-Meteo disagreement) |
 
 ## Data contract
 

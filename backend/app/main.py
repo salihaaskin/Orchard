@@ -14,7 +14,8 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 
-from . import chill, config, data, forecast, interp, seasons, source_compare, source_select
+from . import (chill, config, data, forecast, interp, openmeteo_hist, seasons, source_compare,
+               source_select)
 
 app = FastAPI(title="Chill at My Orchard", version="0.1.0")
 METRICS = ("chill_portions", "chill_hours", "hours_lt_45", "utah_units")
@@ -244,31 +245,52 @@ def validate_all(
 
 
 @app.get("/source")
-def source(lat: float, lon: float, exclude: list[str] = Query(default=[])):
+def source(lat: float, lon: float, exclude: list[str] = Query(default=[]),
+           as_of: date = Query(default=date(2025, 2, 28))):
     """Which temperature source to trust at this orchard, and the error to expect.
 
-    Uses distance to the nearest active station and the elevation difference, and looks up
-    which method had the lowest error at similar stations in the validation table.
+    Works over the chill season ending at as_of (same kind of window as the validation table):
+    finds the stations with data then, the distance and elevation difference to the nearest,
+    and the IDW-vs-Open-Meteo disagreement here. Then asks source_select for the method and
+    the expected error, each chosen by how well it did on stations it never saw.
+    First call for a new area downloads that season (slow); later calls use the cache.
     """
+    c_start, c_end, _ = seasons.chill_window(as_of)
     stations_df = data.get_stations()
-    active = stations_df[stations_df["active"] & ~stations_df["station_id"].isin(exclude)]
-    if active.empty:
-        raise HTTPException(404, "No active stations")
-    near = interp.nearest(active, lat, lon, 1).iloc[0]
+    pool = interp.nearest(stations_df[~stations_df["station_id"].isin(exclude)], lat, lon,
+                          3 * config.NEIGHBORS)
+    hourly = load_hourly(pool["station_id"], c_start, c_end)
+    with_data = stations_df[stations_df["station_id"].isin([s for s, v in hourly.items() if v.notna().any()])]
+    if with_data.empty:
+        raise HTTPException(404, f"No station data near this point in {c_start}..{c_end}")
+    neigh = interp.nearest(with_data, lat, lon, config.NEIGHBORS)
+    near = neigh.iloc[0]
+
     elev = interp.elevation_m(lat, lon)
     elev_source = "open-meteo elevation api"
     if elev is None:  # offline: assume same height as the station, and say so
         elev, elev_source = float(near.elev_m), "assumed equal to nearest station (offline)"
     elev_diff = float(near.elev_m) - elev
 
+    # Warning signal: how much plain IDW and Open-Meteo-guided IDW disagree at this spot.
+    om_here = openmeteo_hist.hourly_archive(lat, lon, c_start, c_end, elev_m=elev)
+    gap = (source_compare.disagreement_c(
+               interp.estimate_series(hourly, neigh, elev),
+               source_compare.om_guided_idw(hourly, neigh, om_here, c_start, c_end))
+           if not om_here.empty else None)
+
     table = source_select.load_table()
     choice = source_select.recommend(float(near.dist_km), elev_diff)
+    err = source_select.expected_error_for(choice["selected_method"], float(near.dist_km), elev_diff, gap)
     return {
         "location": {"lat": lat, "lon": lon, "elev_m": round(elev, 1), "elev_source": elev_source},
+        "season": f"{c_start} to {c_end}",
         "nearest_station": {"station_id": near.station_id, "name": near.get("name"),
                             "dist_km": round(float(near.dist_km), 1),
                             "elev_diff_m": round(elev_diff, 1)},
+        "idw_disagreement_C": gap,
         **choice,
+        "expected_error_selected": err,
         "validation_table": {"rows": len(table),
                              "seasons": sorted(table["season_end"].unique().tolist()) if len(table) else [],
                              "open_meteo_model": config.OPENMETEO_MODEL},
@@ -277,5 +299,8 @@ def source(lat: float, lon: float, exclude: list[str] = Query(default=[])):
 
 @app.get("/source/evaluation")
 def source_evaluation(k: int = config.SELECT_K):
-    """Does picking a source per orchard beat always using one method? (stations it never saw)"""
-    return source_select.evaluate_selector(source_select.load_table(), k)
+    """On stations they never saw: does picking a source per orchard beat always using one
+    method, and which model best predicts the error we report?"""
+    table = source_select.load_table()
+    return {"selector": source_select.evaluate_selector(table, k),
+            "error_models": source_select.evaluate_error_models(table, k=k)}
