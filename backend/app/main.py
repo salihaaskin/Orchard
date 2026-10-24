@@ -54,6 +54,47 @@ def estimate_at(lat, lon, elev, start, end, exclude) -> tuple[pd.Series, pd.Data
     return interp.estimate_series(hourly, neigh, elev), neigh
 
 
+def nearest_with_data(lat, lon, start, end, exclude) -> tuple[pd.Series, pd.Series | None]:
+    """Hourly °F of the closest station that has data in start..end, and its station row."""
+    stations = data.get_stations()
+    for _, row in interp.nearest(stations, lat, lon, 3 * config.NEIGHBORS, exclude=exclude).iterrows():
+        s = load_hourly([row.station_id], start, end).get(row.station_id)
+        if s is not None and s.notna().any():
+            return s, row
+    return pd.Series(dtype=float), None
+
+
+def method_series(method: str, lat, lon, elev, start, end, exclude) -> tuple[pd.Series, dict]:
+    """Hourly °F at the orchard from one of source_compare.METHODS, plus notes on how it was built.
+
+    open_meteo_corrected = nearest station reading + (Open-Meteo here - Open-Meteo at that station).
+    Open-Meteo's archive runs ~5 days behind, so hours it doesn't have yet use IDW instead;
+    their count is reported as hours_from_idw_fallback (never filled silently).
+    """
+    info = {"method": method}
+    if method == "idw":
+        return estimate_at(lat, lon, elev, start, end, exclude)[0], info
+    if method == "open_meteo":
+        return openmeteo_hist.hourly_archive(lat, lon, start, end, elev_m=elev), info
+
+    near, row = nearest_with_data(lat, lon, start, end, exclude)
+    if row is None:
+        return pd.Series(dtype=float), info
+    info["station_id"] = row.station_id
+    if method == "nearest":
+        return near, info
+
+    # open_meteo_corrected
+    om_here = openmeteo_hist.hourly_archive(lat, lon, start, end, elev_m=elev)
+    om_there = openmeteo_hist.hourly_archive(row.lat, row.lon, start, end, elev_m=row.elev_m)
+    corrected = near + (om_here - om_there)
+    # Hours with no Open-Meteo value yet (archive lag) or a gap at the station fall back to IDW.
+    idw = estimate_at(lat, lon, elev, start, end, exclude)[0]
+    est = corrected.combine_first(idw)
+    info["hours_from_idw_fallback"] = int((est.notna() & corrected.reindex(est.index).isna()).sum())
+    return est, info
+
+
 # ---------------------------------------------------------------- endpoints
 
 @app.get("/health")
@@ -88,17 +129,30 @@ def estimate(
         elev = float(interp.nearest(stations_df, lat, lon, 1)["elev_m"].iloc[0])
         elev_source = "nearest station (offline)"
 
-    # 1. So far
+    # 0. Which method to trust for chill here: the per-metric recommendation for chill
+    #    portions (FNRIC's main metric for California; chill hours follow the same rule).
+    #    Every chill number below, including past seasons, uses that one method so they compare.
     c_start, c_end, complete = seasons.chill_window(as_of)
-    est, neigh = estimate_at(lat, lon, elev, c_start, c_end, exclude)
+    assessment = assess_orchard(lat, lon, exclude, c_start, c_end, elev=elev)
+    by_metric = source_select.recommend_by_metric(assessment["dist_km"], assessment["elev_diff_m"],
+                                                  assessment["idw_disagreement_C"])
+    chill_choice = by_metric.get("chill_portions", {"method": "idw",
+                                                    "reason": "No validation table; using IDW."})
+    chill_method = chill_choice["method"]
+    neigh = interp.nearest(stations_df, lat, lon, config.NEIGHBORS, exclude=exclude)
+
+    # 1. So far
+    est, built = method_series(chill_method, lat, lon, elev, c_start, c_end, exclude)
+    if est.dropna().empty and chill_method != "idw":  # e.g. Open-Meteo unreachable
+        chill_method, chill_choice = "idw", {"method": "idw", "reason": f"{chill_method} unavailable; using IDW."}
+        est, built = method_series("idw", lat, lon, elev, c_start, c_end, exclude)
     if est.dropna().empty:
         raise HTTPException(404, "No station data near this point for this season")
     est = clip(est, c_start, c_end)
     so_far = chill.summarize(est, crop, custom_range=(range_low_f, range_high_f))
 
     # How wrong this estimate is likely to be here (from stations we hid and estimated).
-    uncertainty = orchard_uncertainty(assess_orchard(lat, lon, exclude, c_start, c_end, elev=elev),
-                                      so_far["hours_counted"])
+    uncertainty = orchard_uncertainty(assessment, so_far["hours_counted"], method=chill_method)
 
     g_start, g_end, g_started = seasons.gdd_window(as_of)
     if g_started:
@@ -111,7 +165,7 @@ def estimate(
     history = []
     for k in range(1, history_seasons + 1):
         h_start, h_end = seasons.same_window_in(k, c_start, c_end)
-        h_est, _ = estimate_at(lat, lon, elev, h_start, seasons.plus_days(h_end, 14), exclude)
+        h_est, _ = method_series(chill_method, lat, lon, elev, h_start, seasons.plus_days(h_end, 14), exclude)
         if h_est.dropna().empty:
             continue
         at_date = chill.summarize(clip(h_est, h_start, h_end), crop)
@@ -149,7 +203,7 @@ def estimate(
 
     # In replay mode we can also show what actually happened next (honest check of the projection)
     if not live and not complete:
-        nxt, _ = estimate_at(lat, lon, elev, c_start, seasons.plus_days(c_end, 14), exclude)
+        nxt, _ = method_series(chill_method, lat, lon, elev, c_start, seasons.plus_days(c_end, 14), exclude)
         actual_after = chill.summarize(clip(nxt, c_start, seasons.plus_days(c_end, 14)), crop)
         projection["actually_added"] = {m: round(actual_after[m] - so_far[m], 1) for m in METRICS}
 
@@ -160,12 +214,16 @@ def estimate(
                   **{m: round(so_far[m], 1) for m in METRICS},
                   "hours_counted": so_far["hours_counted"], "hours_missing": so_far["hours_missing"],
                   "custom_range": so_far["custom_range"],
+                  "method": chill_method, "method_reason": chill_choice["reason"],
+                  "method_details": built,
                   "curve": daily_curve(est)},
         "gdd": {"start": str(g_start), "end": str(g_end), "started": g_started, "total_c_days": round(gdd["gdd"], 1),
-                "method": "single sine", "thresholds_c": gdd["gdd_thresholds_c"]},
+                "method": "single sine", "temperature_method": "idw", "thresholds_c": gdd["gdd_thresholds_c"]},
         "history": {"seasons": history, "percentiles": pct},
         "projection": projection,
         "uncertainty": uncertainty,
+        "method_by_metric": {q: {k: r[k] for k in ("method", "elevation_rule", "reason")}
+                             for q, r in by_metric.items()},
         "neighbors": neigh[["station_id", "name", "dist_km", "elev_m"]].round(1).to_dict("records"),
         "excluded": exclude,
     }
@@ -284,21 +342,21 @@ def assess_orchard(lat: float, lon: float, exclude, start: date, end: date,
             "idw_disagreement_C": gap}
 
 
-def orchard_uncertainty(a: dict, hours_counted: int) -> dict:
-    """Expected error of this orchard's IDW estimate, for temperature and each chill total.
+def orchard_uncertainty(a: dict, hours_counted: int, method: str = "idw") -> dict:
+    """Expected error of this orchard's estimate by `method`, for temperature and each chill total.
 
     Each error comes from the model that predicted errors best on stations it never saw.
     The validation table holds full Nov 1 - Feb 28 seasons, so chill-total errors are scaled
     by the share of that window counted so far (errors build up as the season goes on).
     """
     args = (a["dist_km"], a["elev_diff_m"], a["idw_disagreement_C"])
-    temp = source_select.expected_error_for("idw", *args, quantity="hourly_temp")
+    temp = source_select.expected_error_for(method, *args, quantity="hourly_temp")
     if temp is None:
         return {"available": False, "reason": "Validation table not built yet."}
     scale = hours_counted / source_select.TABLE_WINDOW_HOURS
     chill_err, warnings = {}, [temp.get("warning")]
     for q in ("chill_portions", "chill_hours", "utah_units"):
-        e = source_select.expected_error_for("idw", *args, quantity=q)
+        e = source_select.expected_error_for(method, *args, quantity=q)
         if e is None:
             continue
         chill_err[q] = {"plus_minus": round(e["expected"] * scale, 1),
@@ -308,7 +366,7 @@ def orchard_uncertainty(a: dict, hours_counted: int) -> dict:
     warnings = [w for w in dict.fromkeys(warnings) if w]
     return {
         "available": True,
-        "method": "idw",
+        "method": method,
         "hourly_temp_mae_C": {"expected": temp["expected"], "range": temp["range"], "model": temp["model"]},
         "chill": chill_err,
         "chill_scaled_to_share_of_season": round(scale, 2),

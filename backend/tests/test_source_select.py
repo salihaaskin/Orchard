@@ -250,3 +250,36 @@ def test_recommend_by_metric_switches_with_elevation(monkeypatch, tmp_path):
     assert hill["chill_portions"]["expected_error"]["unit"] == "portions"
     # where all methods tie, the rule can't beat a single method, so no switching
     assert flat["chill_hours"]["elevation_rule"] is None
+
+
+def test_method_series_corrected_is_nearest_plus_model_difference():
+    from datetime import date
+    from app import main, openmeteo_hist
+    start, end = date(2024, 12, 1), date(2024, 12, 10)
+    est, info = main.method_series("open_meteo_corrected", 39.40, -121.70, 30.0, start, end, [])
+    near, row = main.nearest_with_data(39.40, -121.70, start, end, [])
+    expected = near + (openmeteo_hist.hourly_archive(39.40, -121.70, start, end, elev_m=30.0)
+                       - openmeteo_hist.hourly_archive(row.lat, row.lon, start, end, elev_m=row.elev_m))
+    both = pd.concat([est.rename("e"), expected.rename("x")], axis=1).dropna()
+    assert len(both) > 200 and (both["e"] - both["x"]).abs().max() < 1e-9
+    assert info["station_id"] == row.station_id
+    # every hour the station misses (synthetic data drops ~1%) comes from IDW and is counted
+    assert info["hours_from_idw_fallback"] == int(est.notna().sum() - expected.notna().sum())
+
+
+def test_estimate_uses_recommended_chill_method(monkeypatch, tmp_path):
+    """With a table where corrected Open-Meteo wins above 50 m, a hillside orchard uses it."""
+    path = tmp_path / "loso.csv"
+    make_elevation_table().to_csv(path, index=False)
+    monkeypatch.setattr(config, "VALIDATION_TABLE", path)
+    for f in (source_select._elevation_evaluation_for, source_select._error_evaluation_for):
+        f.cache_clear()
+    # pretend the orchard sits 300 m above every station
+    monkeypatch.setattr(interp, "elevation_m", lambda lat, lon: 400.0)
+    body = client.get("/estimate", params={"lat": 39.42, "lon": -121.71, "as_of": "2025-01-15",
+                                          "history_seasons": 1}).json()
+    assert body["chill"]["method"] == "open_meteo_corrected"
+    assert body["uncertainty"]["method"] == "open_meteo_corrected"
+    assert body["method_by_metric"]["chill_portions"]["elevation_rule"] is not None
+    assert body["gdd"]["temperature_method"] == "idw"
+    assert body["chill"]["chill_portions"] > 0
