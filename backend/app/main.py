@@ -96,6 +96,10 @@ def estimate(
     est = clip(est, c_start, c_end)
     so_far = chill.summarize(est, crop, custom_range=(range_low_f, range_high_f))
 
+    # How wrong this estimate is likely to be here (from stations we hid and estimated).
+    uncertainty = orchard_uncertainty(assess_orchard(lat, lon, exclude, c_start, c_end, elev=elev),
+                                      so_far["hours_counted"])
+
     g_start, g_end, g_started = seasons.gdd_window(as_of)
     if g_started:
         g_est, _ = estimate_at(lat, lon, elev, g_start, g_end, exclude)
@@ -161,6 +165,7 @@ def estimate(
                 "method": "single sine", "thresholds_c": gdd["gdd_thresholds_c"]},
         "history": {"seasons": history, "percentiles": pct},
         "projection": projection,
+        "uncertainty": uncertainty,
         "neighbors": neigh[["station_id", "name", "dist_km", "elev_m"]].round(1).to_dict("records"),
         "excluded": exclude,
     }
@@ -244,6 +249,79 @@ def validate_all(
     }
 
 
+def assess_orchard(lat: float, lon: float, exclude, start: date, end: date,
+                   elev: float | None = None) -> dict:
+    """What we know about this spot before trusting an estimate there.
+
+    Over start..end: the stations that had data, the nearest one (distance, elevation
+    difference) and the IDW-vs-Open-Meteo disagreement here (None if Open-Meteo is unreachable).
+    These are the same features the validation table records for each test station.
+    """
+    stations_df = data.get_stations()
+    pool = interp.nearest(stations_df[~stations_df["station_id"].isin(exclude)], lat, lon,
+                          3 * config.NEIGHBORS)
+    hourly = load_hourly(pool["station_id"], start, end)
+    with_data = stations_df[stations_df["station_id"].isin([s for s, v in hourly.items() if v.notna().any()])]
+    if with_data.empty:
+        raise HTTPException(404, f"No station data near this point in {start}..{end}")
+    neigh = interp.nearest(with_data, lat, lon, config.NEIGHBORS)
+    near = neigh.iloc[0]
+
+    elev_source = "given"
+    if elev is None:
+        elev, elev_source = interp.elevation_m(lat, lon), "open-meteo elevation api"
+    if elev is None:  # offline: assume same height as the station, and say so
+        elev, elev_source = float(near.elev_m), "assumed equal to nearest station (offline)"
+
+    # Warning signal: how much plain IDW and Open-Meteo-guided IDW disagree at this spot.
+    om_here = openmeteo_hist.hourly_archive(lat, lon, start, end, elev_m=elev)
+    gap = (source_compare.disagreement_c(
+               interp.estimate_series(hourly, neigh, elev),
+               source_compare.om_guided_idw(hourly, neigh, om_here, start, end))
+           if not om_here.empty else None)
+    return {"elev_m": elev, "elev_source": elev_source, "near": near,
+            "dist_km": float(near.dist_km), "elev_diff_m": float(near.elev_m) - elev,
+            "idw_disagreement_C": gap}
+
+
+def orchard_uncertainty(a: dict, hours_counted: int) -> dict:
+    """Expected error of this orchard's IDW estimate, for temperature and each chill total.
+
+    Each error comes from the model that predicted errors best on stations it never saw.
+    The validation table holds full Nov 1 - Feb 28 seasons, so chill-total errors are scaled
+    by the share of that window counted so far (errors build up as the season goes on).
+    """
+    args = (a["dist_km"], a["elev_diff_m"], a["idw_disagreement_C"])
+    temp = source_select.expected_error_for("idw", *args, quantity="hourly_temp")
+    if temp is None:
+        return {"available": False, "reason": "Validation table not built yet."}
+    scale = hours_counted / source_select.TABLE_WINDOW_HOURS
+    chill_err, warnings = {}, [temp.get("warning")]
+    for q in ("chill_portions", "chill_hours", "utah_units"):
+        e = source_select.expected_error_for("idw", *args, quantity=q)
+        if e is None:
+            continue
+        chill_err[q] = {"plus_minus": round(e["expected"] * scale, 1),
+                        "range": [round(v * scale, 1) for v in e["range"]],
+                        "unit": e["unit"], "model": e["model"]}
+        warnings.append(e.get("warning"))
+    warnings = [w for w in dict.fromkeys(warnings) if w]
+    return {
+        "available": True,
+        "method": "idw",
+        "hourly_temp_mae_C": {"expected": temp["expected"], "range": temp["range"], "model": temp["model"]},
+        "chill": chill_err,
+        "chill_scaled_to_share_of_season": round(scale, 2),
+        "gdd": ("Not validated: our tests cover Nov 1 - Feb 28 and GDD counts from bloom. "
+                "Only the hourly temperature error applies."),
+        "within_tested_range": not warnings,
+        **({"warning": " ".join(warnings)} if warnings else {}),
+        "inputs": {"nearest_station": a["near"].station_id, "dist_km": round(a["dist_km"], 1),
+                   "elev_diff_m": round(a["elev_diff_m"], 1), "idw_disagreement_C": a["idw_disagreement_C"]},
+        "ranges_hold_real_error": "about 80% of the time on stations we never saw",
+    }
+
+
 @app.get("/source")
 def source(lat: float, lon: float, exclude: list[str] = Query(default=[]),
            as_of: date = Query(default=date(2025, 2, 28))):
@@ -256,39 +334,20 @@ def source(lat: float, lon: float, exclude: list[str] = Query(default=[]),
     First call for a new area downloads that season (slow); later calls use the cache.
     """
     c_start, c_end, _ = seasons.chill_window(as_of)
-    stations_df = data.get_stations()
-    pool = interp.nearest(stations_df[~stations_df["station_id"].isin(exclude)], lat, lon,
-                          3 * config.NEIGHBORS)
-    hourly = load_hourly(pool["station_id"], c_start, c_end)
-    with_data = stations_df[stations_df["station_id"].isin([s for s, v in hourly.items() if v.notna().any()])]
-    if with_data.empty:
-        raise HTTPException(404, f"No station data near this point in {c_start}..{c_end}")
-    neigh = interp.nearest(with_data, lat, lon, config.NEIGHBORS)
-    near = neigh.iloc[0]
-
-    elev = interp.elevation_m(lat, lon)
-    elev_source = "open-meteo elevation api"
-    if elev is None:  # offline: assume same height as the station, and say so
-        elev, elev_source = float(near.elev_m), "assumed equal to nearest station (offline)"
-    elev_diff = float(near.elev_m) - elev
-
-    # Warning signal: how much plain IDW and Open-Meteo-guided IDW disagree at this spot.
-    om_here = openmeteo_hist.hourly_archive(lat, lon, c_start, c_end, elev_m=elev)
-    gap = (source_compare.disagreement_c(
-               interp.estimate_series(hourly, neigh, elev),
-               source_compare.om_guided_idw(hourly, neigh, om_here, c_start, c_end))
-           if not om_here.empty else None)
+    a = assess_orchard(lat, lon, exclude, c_start, c_end)
+    near = a["near"]
 
     table = source_select.load_table()
-    choice = source_select.recommend(float(near.dist_km), elev_diff)
-    err = source_select.expected_error_for(choice["selected_method"], float(near.dist_km), elev_diff, gap)
+    choice = source_select.recommend(a["dist_km"], a["elev_diff_m"])
+    err = source_select.expected_error_for(choice["selected_method"], a["dist_km"], a["elev_diff_m"],
+                                           a["idw_disagreement_C"])
     return {
-        "location": {"lat": lat, "lon": lon, "elev_m": round(elev, 1), "elev_source": elev_source},
+        "location": {"lat": lat, "lon": lon, "elev_m": round(a["elev_m"], 1), "elev_source": a["elev_source"]},
         "season": f"{c_start} to {c_end}",
         "nearest_station": {"station_id": near.station_id, "name": near.get("name"),
-                            "dist_km": round(float(near.dist_km), 1),
-                            "elev_diff_m": round(elev_diff, 1)},
-        "idw_disagreement_C": gap,
+                            "dist_km": round(a["dist_km"], 1),
+                            "elev_diff_m": round(a["elev_diff_m"], 1)},
+        "idw_disagreement_C": a["idw_disagreement_C"],
         **choice,
         "expected_error_selected": err,
         "validation_table": {"rows": len(table),
@@ -300,7 +359,8 @@ def source(lat: float, lon: float, exclude: list[str] = Query(default=[]),
 @app.get("/source/evaluation")
 def source_evaluation(k: int = config.SELECT_K):
     """On stations they never saw: does picking a source per orchard beat always using one
-    method, and which model best predicts the error we report?"""
+    method, and which model best predicts the error we report (per quantity)?"""
     table = source_select.load_table()
     return {"selector": source_select.evaluate_selector(table, k),
-            "error_models": source_select.evaluate_error_models(table, k=k)}
+            "error_models": {q: source_select.evaluate_error_models(table, k=k, quantity=q)
+                             for q in source_select.QUANTITIES}}

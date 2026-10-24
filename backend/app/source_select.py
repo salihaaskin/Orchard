@@ -146,12 +146,27 @@ def recommend(dist_km: float, elev_diff_m: float) -> dict:
 
 
 # ---------------------------------------------------------------- how wrong will IDW be here?
-# Three ways to predict the hourly MAE of a method at an orchard, before we have any reading
-# there. evaluate_error_models() scores them on unseen stations; the winner is used in /source.
+# Four ways to predict how wrong a method will be at an orchard, before we have any reading
+# there. evaluate_error_models() scores them on unseen stations, separately for each quantity
+# (hourly temperature, chill portions, chill hours, Utah units); the winner is used.
 
 # table_average is the reference: the same guess everywhere. A model must beat it to be useful.
 ERROR_MODELS = ("table_average", "similar_stations", "disagreement", "disagreement+geometry")
+# Every table row covers Nov 1 - Feb 28 (120 days); season-total errors are for that window.
+TABLE_WINDOW_HOURS = 120 * 24
 INTERVAL_Q = (0.1, 0.9)  # the range we report should hold the real error about 80% of the time
+# quantity -> (table column pattern, unit). Season totals use the size of the error (abs).
+QUANTITIES = {
+    "hourly_temp": ("mae_C_{m}", "°C"),
+    "chill_portions": ("chill_portions_error_{m}", "portions"),
+    "chill_hours": ("chill_hours_error_{m}", "hours"),
+    "utah_units": ("utah_units_error_{m}", "units"),
+}
+
+
+def _target(table: pd.DataFrame, quantity: str, method: str) -> pd.Series:
+    """The error we want to predict, one value per test case (always >= 0)."""
+    return table[QUANTITIES[quantity][0].format(m=method)].abs()
 
 
 def _features(df: pd.DataFrame, model: str) -> np.ndarray:
@@ -164,92 +179,99 @@ def _features(df: pd.DataFrame, model: str) -> np.ndarray:
 
 
 def predict_error(table: pd.DataFrame, model: str, dist_km: float, elev_diff_m: float,
-                  disagreement: float | None, method: str = "idw", k: int | None = None) -> dict | None:
-    """Expected hourly MAE (°C) of `method` at one orchard, plus an ~80% range.
+                  disagreement: float | None, method: str = "idw", k: int | None = None,
+                  quantity: str = "hourly_temp") -> dict | None:
+    """Expected error of `method` at one orchard for one quantity, plus an ~80% range.
 
+    table_average: the average error over all test cases; range = their 10th-90th percentile.
     similar_stations: average over the k test stations most like this orchard (distance,
         elevation difference); range = their 10th-90th percentile.
-    disagreement(+geometry): straight-line fit of MAE on the IDW-vs-Open-Meteo gap (and distance,
-        elevation difference); range = prediction + the fit's 10th-90th percentile miss.
-    Returns None if the model can't be used (e.g. no disagreement value).
+    disagreement(+geometry): straight-line fit of the error on the IDW-vs-Open-Meteo gap (and
+        distance, elevation difference); range = prediction + the fit's 10th-90th percentile miss.
+    Returns None if the model can't be used (e.g. no disagreement value, column missing).
     """
-    target = f"mae_C_{method}"
-    if model == "table_average":
-        vals = table[target].dropna()
-        if vals.empty:
-            return None
-        mean, lo, hi = vals.mean(), vals.quantile(INTERVAL_Q[0]), vals.quantile(INTERVAL_Q[1])
-    elif model == "similar_stations":
-        similar = table.assign(gap=_gap(table, dist_km, elev_diff_m)).nsmallest(k or config.SELECT_K, "gap")
-        vals = similar[target].dropna()
+    col = QUANTITIES[quantity][0].format(m=method)
+    if col not in table:
+        return None
+    table = table.assign(_y=_target(table, quantity, method))
+    if model in ("table_average", "similar_stations"):
+        pool = (table if model == "table_average" else
+                table.assign(gap=_gap(table, dist_km, elev_diff_m)).nsmallest(k or config.SELECT_K, "gap"))
+        vals = pool["_y"].dropna()
         if vals.empty:
             return None
         mean, lo, hi = vals.mean(), vals.quantile(INTERVAL_Q[0]), vals.quantile(INTERVAL_Q[1])
     else:
         if disagreement is None or "idw_disagreement_C" not in table:
             return None
-        train = table.dropna(subset=["idw_disagreement_C", target])
+        train = table.dropna(subset=["idw_disagreement_C", "_y"])
         if len(train) < 10:
             return None
-        X, y = _features(train, model), train[target].to_numpy(float)
+        X, y = _features(train, model), train["_y"].to_numpy(float)
         coef, *_ = np.linalg.lstsq(X, y, rcond=None)
         resid = y - X @ coef
         row = pd.DataFrame({"idw_disagreement_C": [disagreement], "nearest_dist_km": [dist_km],
                             "nearest_elev_diff_m": [elev_diff_m]})
         mean = float((_features(row, model) @ coef)[0])
         lo, hi = mean + np.quantile(resid, INTERVAL_Q[0]), mean + np.quantile(resid, INTERVAL_Q[1])
-    return {"expected_mae_C": round(float(max(mean, 0.0)), 2),
-            "range_mae_C": [round(float(max(lo, 0.0)), 2), round(float(hi), 2)],
-            "model": model}
+    digits = 2 if quantity == "hourly_temp" else 1
+    return {"expected": round(float(max(mean, 0.0)), digits),
+            "range": [round(float(max(lo, 0.0)), digits), round(float(hi), digits)],
+            "unit": QUANTITIES[quantity][1], "model": model}
 
 
-def evaluate_error_models(table: pd.DataFrame, method: str = "idw", k: int | None = None) -> dict:
+def evaluate_error_models(table: pd.DataFrame, method: str = "idw", k: int | None = None,
+                          quantity: str = "hourly_temp") -> dict:
     """Which error model best predicts how wrong `method` will be at a station it never saw?
 
     Nested leave-one-station-out: each station's error is predicted from the other stations only.
-    Scores: average miss of the predicted MAE (lower is better), correlation with the real MAE,
-    and how often the real MAE fell inside the reported range (aim: about 80%).
+    Scores: average miss of the predicted error (lower is better), correlation with the real
+    error, and how often the real error fell inside the reported range (aim: about 80%).
     """
-    if table.empty or "idw_disagreement_C" not in table:
+    col = QUANTITIES[quantity][0].format(m=method)
+    if table.empty or "idw_disagreement_C" not in table or col not in table:
         return {"status": "no_validation_table"}
     rows = []
     for sid, test in table.groupby("station_id"):
         train = table[table["station_id"] != sid]
         for _, r in test.iterrows():
-            out = {"station_id": sid, "season_end": r["season_end"], "actual": r[f"mae_C_{method}"]}
+            actual = abs(r[col])
+            out = {"station_id": sid, "season_end": r["season_end"], "actual": actual}
+            gap = r["idw_disagreement_C"] if pd.notna(r["idw_disagreement_C"]) else None
             for model in ERROR_MODELS:
-                gap = r["idw_disagreement_C"] if pd.notna(r["idw_disagreement_C"]) else None
-                p = predict_error(train, model, r["nearest_dist_km"], r["nearest_elev_diff_m"], gap, method, k)
-                out[model] = p["expected_mae_C"] if p else np.nan
-                out[f"{model}_in_range"] = (p["range_mae_C"][0] <= r[f"mae_C_{method}"] <= p["range_mae_C"][1]
-                                            if p else np.nan)
-                out[f"{model}_width"] = p["range_mae_C"][1] - p["range_mae_C"][0] if p else np.nan
+                p = predict_error(train, model, r["nearest_dist_km"], r["nearest_elev_diff_m"],
+                                  gap, method, k, quantity)
+                out[model] = p["expected"] if p else np.nan
+                out[f"{model}_in_range"] = p["range"][0] <= actual <= p["range"][1] if p else np.nan
+                out[f"{model}_width"] = p["range"][1] - p["range"][0] if p else np.nan
             rows.append(out)
-    p = pd.DataFrame(rows).dropna(subset=list(ERROR_MODELS))
+    p = pd.DataFrame(rows).dropna(subset=list(ERROR_MODELS) + ["actual"])
     scores = {}
     for model in ERROR_MODELS:
         scores[model] = {
-            "mean_miss_C": round(float((p[model] - p["actual"]).abs().mean()), 3),
-            "correlation": round(float(np.corrcoef(p[model], p["actual"])[0, 1]), 2),
+            "mean_miss": round(float((p[model] - p["actual"]).abs().mean()), 3),
+            # undefined when either side never varies (e.g. the same guess everywhere)
+            "correlation": (round(float(np.corrcoef(p[model], p["actual"])[0, 1]), 2)
+                            if p[model].std() > 0 and p["actual"].std() > 0 else None),
             "range_coverage_pct": round(float(p[f"{model}_in_range"].astype(float).mean() * 100), 1),
-            "mean_range_width_C": round(float(p[f"{model}_width"].mean()), 2),
+            "mean_range_width": round(float(p[f"{model}_width"].mean()), 2),
         }
-    best = min(ERROR_MODELS, key=lambda m: scores[m]["mean_miss_C"])
-    return {"method": method, "cases": len(p), "stations": int(p["station_id"].nunique()),
+    best = min(ERROR_MODELS, key=lambda m: scores[m]["mean_miss"])
+    return {"quantity": quantity, "unit": QUANTITIES[quantity][1], "method": method,
+            "cases": len(p), "stations": int(p["station_id"].nunique()),
             "scores": scores, "best_model": best,
-            "gain_vs_table_average_C": round(scores["table_average"]["mean_miss_C"]
-                                             - scores[best]["mean_miss_C"], 3),
+            "gain_vs_table_average": round(scores["table_average"]["mean_miss"] - scores[best]["mean_miss"], 3),
             "note": "Each station's error is predicted from the other stations only."}
 
 
-@lru_cache(maxsize=4)
-def _error_evaluation_for(path: str, mtime: float) -> dict:
+@lru_cache(maxsize=16)
+def _error_evaluation_for(path: str, mtime: float, quantity: str = "hourly_temp") -> dict:
     """evaluate_error_models on the saved table, recomputed only when the file changes."""
-    return evaluate_error_models(load_table())
+    return evaluate_error_models(load_table(), quantity=quantity)
 
 
 def expected_error_for(method: str, dist_km: float, elev_diff_m: float,
-                       disagreement: float | None) -> dict | None:
+                       disagreement: float | None, quantity: str = "hourly_temp") -> dict | None:
     """Expected error at an orchard from whichever error model won on unseen stations.
 
     Only for IDW (the disagreement signal is about IDW). Falls back to similar_stations if the
@@ -258,14 +280,15 @@ def expected_error_for(method: str, dist_km: float, elev_diff_m: float,
     table = load_table()
     if table.empty or method != "idw":
         return None
-    ev = _error_evaluation_for(str(config.VALIDATION_TABLE), config.VALIDATION_TABLE.stat().st_mtime)
+    ev = _error_evaluation_for(str(config.VALIDATION_TABLE), config.VALIDATION_TABLE.stat().st_mtime,
+                               quantity)
     if ev.get("status") == "no_validation_table":
         return None
-    est = (predict_error(table, ev["best_model"], dist_km, elev_diff_m, disagreement, method)
-           or predict_error(table, "similar_stations", dist_km, elev_diff_m, disagreement, method))
+    est = (predict_error(table, ev["best_model"], dist_km, elev_diff_m, disagreement, method, quantity=quantity)
+           or predict_error(table, "similar_stations", dist_km, elev_diff_m, disagreement, method,
+                            quantity=quantity))
     est["chosen_because"] = (f"lowest average miss on unseen stations "
-                             f"({ev['scores'][ev['best_model']]['mean_miss_C']} °C, {ev['cases']} cases)")
-    est["evaluation"] = ev["scores"]
+                             f"({ev['scores'][ev['best_model']]['mean_miss']} {ev['unit']}, {ev['cases']} cases)")
 
     # Our tests only cover what they cover: flag orchards outside that range instead of
     # quietly extrapolating (e.g. a station 4 km away when every test case was 7+ km).

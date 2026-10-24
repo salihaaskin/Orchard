@@ -180,7 +180,8 @@ def station_row(result: dict) -> dict:
         row[f"mae_C_{name}"] = m[name].get("mae_C")
         row[f"bias_C_{name}"] = m[name].get("bias_C")
         row[f"{within}_{name}"] = m[name].get(within)
-        row[f"chill_portions_error_{name}"] = m[name].get("season_total_error", {}).get("chill_portions")
+        for total in ("chill_portions", "chill_hours", "utah_units"):
+            row[f"{total}_error_{name}"] = m[name].get("season_total_error", {}).get(total)
     for name in OPEN_METEO_METHODS:
         # > 0: this Open-Meteo method is closer to the real station than the nearest other station is.
         near_mae, om_mae = row["mae_C_nearest"], row[f"mae_C_{name}"]

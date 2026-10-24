@@ -80,7 +80,7 @@ data/cache/  cached station data (git-ignored, shared into Docker as a volume)
 
 | Endpoint | What it answers |
 | --- | --- |
-| `GET /estimate?lat=&lon=&as_of=&crop=&exclude=` | Questions 1–3 for any point |
+| `GET /estimate?lat=&lon=&as_of=&crop=&exclude=` | Questions 1–3 for any point; `uncertainty` gives the expected error (± and ~80% range) of the hourly temperature and each chill total, from stations we hid and estimated |
 | `GET /validate?station_id=&as_of=` | Hide a station, estimate it, report error with and without the elevation adjustment; `method_comparison` scores nearest station vs IDW vs Open-Meteo (MAE, RMSE, bias, % within ±2 °C, chill/GDD error) on the same hours |
 | `GET /validate/all?lat=&lon=&radius_km=&max_stations=` | Same comparison for every active station near a point, grouped by distance to the nearest station |
 | `GET /source?lat=&lon=` | Source Selection Engine: which method to trust at this orchard and the error to expect, from similar stations in `data/validation/loso_table.csv` |
