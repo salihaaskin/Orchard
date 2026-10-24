@@ -100,3 +100,30 @@ def test_simulated_fault_is_caught_and_repaired():
     assert sim["caught"] is True
     assert sim["error_after_repair_C"] < sim["error_of_broken_readings_C"]
     assert client.get("/sensor/health", params={"station_id": "SYN-B", "simulate": "melt"}).status_code == 400
+
+
+def test_estimate_repairs_high_confidence_faults_by_default(monkeypatch):
+    """With SENSOR_REPAIR on (default), a high-confidence fault is repaired in /estimate."""
+    from app import config, interp, main
+    assert config.SENSOR_REPAIR is True
+    monkeypatch.setattr(interp, "elevation_m", lambda lat, lon: 40.0)
+    calls = {}
+
+    def fake_health(station_id, start, end, *args, **kwargs):
+        raw = main.load_hourly([station_id], start, end)[station_id]
+        calls["station"] = station_id
+        report = {"station_id": station_id, "status": "alert", "alert_confidence": "high",
+                  "faulty_hours": 5, "episodes": [{"type": "stuck"}],
+                  "repair": {"hours_by_source": {"sensor": len(raw) - 5, "idw_anchored": 5}}}
+        return report, raw - 1.0  # a visibly different "repaired" record
+
+    monkeypatch.setattr(main, "station_health", fake_health)
+    monkeypatch.setattr(main.source_select, "recommend_by_metric",
+                        lambda *a: {"chill_portions": {"method": "nearest", "reason": "test",
+                                                       "elevation_rule": None}})
+    body = client.get("/estimate", params={"lat": 39.42, "lon": -121.71, "as_of": "2025-01-15",
+                                          "history_seasons": 1}).json()
+    alerts = body["sensor_alerts"]
+    assert alerts["repaired_in_this_estimate"] is True
+    assert alerts["repair_hours_by_source"]["idw_anchored"] == 5
+    assert body["chill"]["method_details"]["station_id"] == calls["station"]

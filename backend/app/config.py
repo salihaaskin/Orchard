@@ -72,9 +72,10 @@ SENSOR_DEVIATION_HOURS = 24
 SENSOR_DEVIATION_C = float(os.getenv("SENSOR_DEVIATION_C", 4.0))
 # Alarms are "low confidence" when the nearest neighbor (the reference) is farther than this.
 SENSOR_REFERENCE_MAX_KM = 50.0
-# Replace faulty hours with an estimate in /estimate? Off by default: the team rule is that
-# gaps longer than MAX_FILL_HOURS stay missing. /sensor/health always shows the repair.
-SENSOR_REPAIR = os.getenv("SENSOR_REPAIR", "false").lower() == "true"
+# Replace faulty hours (and gaps longer than MAX_FILL_HOURS) with the tested fill in /estimate.
+# On by default (team decision): only for high-confidence alarms, and every repaired hour is
+# labeled and counted. Set SENSOR_REPAIR=false to keep long gaps missing instead.
+SENSOR_REPAIR = os.getenv("SENSOR_REPAIR", "true").lower() == "true"
 
 # Preset demo orchards. Coordinates are placeholders until the team picks real spots.
 DEMO_ORCHARDS = {
