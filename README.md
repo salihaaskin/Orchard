@@ -93,6 +93,7 @@ data/cache/  cached station data (git-ignored, shared into Docker as a volume)
 
 | Endpoint | What it answers |
 | --- | --- |
+| `GET /geocode?q=` | Find a town or place by name (California first), so growers can search instead of typing coordinates |
 | `GET /estimate?lat=&lon=&as_of=&crop=&exclude=` | Questions 1–3 for any point. Chill (so far, past seasons, projection) uses the method `/source` recommends for chill portions at this orchard (`chill.method`, e.g. nearest station on flat ground, corrected Open-Meteo at 50+ m elevation difference); GDD uses IDW. `uncertainty` gives the expected error (± and ~80% range) of the hourly temperature and each chill total, from stations we hid and estimated |
 | `GET /sensor/health?station_id=&as_of=&simulate=` | Is this station's sensor working? Faulty stretches (long gaps, impossible values, stuck readings while neighbors move, spikes, day-long drift) with reasons, and the record repaired with anchored IDW; `simulate=stuck|drift|spike|missing` plants a fault for a demo |
 | `GET /validate?station_id=&as_of=` | Hide a station, estimate it, report error with and without the elevation adjustment; `method_comparison` scores nearest station vs IDW vs Open-Meteo (MAE, RMSE, bias, % within ±2 °C, chill/GDD error) on the same hours |
@@ -132,4 +133,4 @@ Every stage reads and writes one hourly table:
 
 ## Data and credits
 
-CIMIS (California Department of Water Resources) · Open-Meteo (forecast, elevation, and Historical Weather API; Copernicus DEM; ERA5-Land, contains modified Copernicus Climate Change Service information) · chill models as described by UC Davis FNRIC · Dynamic Model after Fishman et al. (1987) and Erez et al. (1990), following chillR (Luedeling).
+CIMIS (California Department of Water Resources) · Open-Meteo (forecast, elevation, Historical Weather and Geocoding APIs; Copernicus DEM; place search uses GeoNames; ERA5-Land, contains modified Copernicus Climate Change Service information) · chill models as described by UC Davis FNRIC · Dynamic Model after Fishman et al. (1987) and Erez et al. (1990), following chillR (Luedeling).

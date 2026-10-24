@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 from fastapi import FastAPI, HTTPException, Query
 
 from . import (chill, config, data, evidence, forecast, interp, openmeteo_hist, seasons,
@@ -198,6 +199,29 @@ def stations():
 @app.get("/demo")
 def demo():
     return config.DEMO_ORCHARDS
+
+
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+
+
+@app.get("/geocode")
+def geocode(q: str, count: int = 5):
+    """Find a town or place by name (Open-Meteo geocoding, GeoNames data), California first.
+
+    Lets a grower type "Chico" instead of coordinates. Returns [] if nothing matches or the
+    service can't be reached.
+    """
+    try:
+        r = requests.get(GEOCODE_URL, params={"name": q, "count": 20, "language": "en",
+                                              "format": "json", "countryCode": "US"}, timeout=10)
+        r.raise_for_status()
+        results = r.json().get("results") or []
+    except Exception:
+        return []
+    places = [{"name": p.get("name"), "admin1": p.get("admin1"), "admin2": p.get("admin2"),
+               "lat": p["latitude"], "lon": p["longitude"]} for p in results]
+    places.sort(key=lambda p: p["admin1"] != "California")  # California first, order otherwise kept
+    return places[:count]
 
 
 @app.get("/estimate")
