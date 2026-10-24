@@ -188,3 +188,54 @@ def validate(station_id: str, as_of: date = Query(default=date(2025, 2, 28))):
             "no_elevation_adjustment": no_elev, "method_comparison": comparison,
             "data_source": config.DATA_SOURCE,
             "generated": datetime.now().isoformat(timespec="seconds")}
+
+
+@app.get("/validate/all")
+def validate_all(
+    as_of: date = Query(default=date(2025, 2, 28)),
+    lat: float = config.DEMO_ORCHARDS["durham"]["lat"],
+    lon: float = config.DEMO_ORCHARDS["durham"]["lon"],
+    radius_km: float = 150.0,
+    max_stations: int = 12,
+    include_inactive: bool = False,
+):
+    """Run method_comparison for each station near (lat, lon), one at a time.
+
+    Gives the evidence table: per station, how well nearest station / IDW / Open-Meteo
+    stand in for it, plus averages grouped by distance to the nearest neighbor.
+    First run fetches from CIMIS and Open-Meteo (a few minutes); later runs use the cache.
+    """
+    stations_df = data.get_stations()
+    c_start, c_end, _ = seasons.chill_window(as_of)
+    pool = stations_df if include_inactive else stations_df[stations_df["active"]]
+    targets = interp.nearest(pool, lat, lon, max_stations)
+    targets = targets[targets["dist_km"] <= radius_km]
+
+    rows, skipped = [], []
+    for sid in targets["station_id"]:
+        target = stations_df.set_index("station_id").loc[sid]
+        # Load a wider pool than NEIGHBORS: some nearby stations have closed and return no data.
+        pool_ids = interp.nearest(stations_df, target.lat, target.lon, 3 * config.NEIGHBORS,
+                                  exclude=[sid])["station_id"]
+        hourly = load_hourly(list(pool_ids) + [sid], c_start, c_end)
+        if sid not in hourly or hourly[sid].dropna().empty:
+            skipped.append({"station_id": sid, "reason": "no station data this season"})
+            continue
+        result = source_compare.compare_methods(stations_df, hourly, sid, c_start, c_end)
+        if result["hours_compared"] < source_compare.MIN_HOURS:
+            skipped.append({"station_id": sid, "reason": f"only {result['hours_compared']} shared hours"})
+            continue
+        rows.append(source_compare.station_row(result))
+
+    return {
+        "season": f"{c_start} to {c_end}",
+        "center": {"lat": lat, "lon": lon, "radius_km": radius_km},
+        "open_meteo_model": config.OPENMETEO_MODEL,
+        "stations": rows,
+        "by_nearest_distance": source_compare.summarize_by_distance(rows),
+        "open_meteo_beats_nearest": sum(1 for r in rows if (r["open_meteo_mae_gain_vs_nearest_C"] or 0) > 0),
+        "stations_compared": len(rows),
+        "skipped": skipped,
+        "data_source": config.DATA_SOURCE,
+        "note": "Pilot check over one season; few stations per distance group means weak evidence.",
+    }

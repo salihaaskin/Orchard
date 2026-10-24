@@ -18,6 +18,11 @@ from . import chill, config, interp, openmeteo_hist
 METHODS = ("nearest", "idw", "open_meteo")
 TOTALS = ("chill_hours", "utah_units", "chill_portions", "gdd")
 
+# A station needs at least 30 days of shared hours to count in the multi-station summary.
+MIN_HOURS = 30 * 24
+# Group stations by how far away their nearest neighbor is (km): does Open-Meteo win when it's far?
+DISTANCE_BINS_KM = (0, 15, 30, 50, float("inf"))
+
 
 def error_metrics(actual_f: pd.Series, predicted_f: pd.Series) -> dict:
     """Hourly error of predicted minus actual: MAE, RMSE, bias in °F and °C, share within ±WITHIN_C.
@@ -53,11 +58,12 @@ def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], statio
     """
     target = stations.set_index("station_id").loc[station_id]
     actual = hourly[station_id]
-    neigh = interp.nearest(stations, target.lat, target.lon, config.NEIGHBORS, exclude=[station_id])
-
-    # nearest: the closest neighbor that actually has data for this window
-    with_data = neigh[neigh["station_id"].isin([s for s, v in hourly.items() if not v.dropna().empty])]
-    nearest_row = with_data.iloc[0] if not with_data.empty else None
+    # Neighbors come only from stations that actually have data this window: closed stations
+    # still sit in the CIMIS list and would otherwise leave nearest/IDW with nothing to use.
+    has_data = [s for s, v in hourly.items() if not v.dropna().empty]
+    neigh = interp.nearest(stations[stations["station_id"].isin(has_data)], target.lat, target.lon,
+                           config.NEIGHBORS, exclude=[station_id])
+    nearest_row = neigh.iloc[0] if not neigh.empty else None
 
     estimates = {
         "nearest": hourly[nearest_row.station_id] if nearest_row is not None else pd.Series(dtype=float),
@@ -66,8 +72,10 @@ def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], statio
     }
 
     # Same hours for everyone: keep only hours where the station and all three estimates exist.
-    frame = pd.concat([actual.rename("actual")] + [estimates[m].rename(m) for m in METHODS], axis=1)
-    available = [m for m in METHODS if frame[m].notna().any()]
+    # An empty estimate (e.g. Open-Meteo unreachable) is left out: it has no dates to line up on.
+    present = [m for m in METHODS if not estimates[m].dropna().empty]
+    frame = pd.concat([actual.rename("actual")] + [estimates[m].rename(m) for m in present], axis=1)
+    available = present
     common = frame[["actual"] + available].dropna()
 
     truth = chill.summarize(common["actual"], crop)
@@ -95,6 +103,8 @@ def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], statio
                      if {"nearest", "open_meteo"} <= scored.keys() else None)
     return {
         "station_id": station_id,
+        "name": target.get("name"),
+        "elev_m": round(float(target.elev_m), 1),
         "window": {"start": str(start), "end": str(end)},
         "hours_in_station_record": int(actual.notna().sum()),
         "hours_compared": int(len(common)),
@@ -105,3 +115,51 @@ def compare_methods(stations: pd.DataFrame, hourly: dict[str, pd.Series], statio
         "open_meteo_mae_gain_vs_nearest_F": om_vs_nearest,
         "note": "One station and one season: a pilot check, not a general accuracy claim.",
     }
+
+
+def station_row(result: dict) -> dict:
+    """Flatten one compare_methods() result into a single table row (°C, for charts)."""
+    m = result["methods"]
+    near = m["nearest"].get("station") or {}
+    row = {
+        "station_id": result["station_id"], "name": result["name"], "elev_m": result["elev_m"],
+        "hours_compared": result["hours_compared"],
+        "nearest_station_id": near.get("station_id"),
+        "nearest_dist_km": near.get("dist_km"),
+        "nearest_elev_diff_m": near.get("elev_diff_m"),
+        "best_method_by_mae": result["best_method_by_mae"],
+    }
+    within = f"pct_within_{config.WITHIN_C:g}C"
+    for name in METHODS:
+        row[f"mae_C_{name}"] = m[name].get("mae_C")
+        row[f"bias_C_{name}"] = m[name].get("bias_C")
+        row[f"{within}_{name}"] = m[name].get(within)
+        row[f"chill_portions_error_{name}"] = m[name].get("season_total_error", {}).get("chill_portions")
+    if row["mae_C_nearest"] is not None and row["mae_C_open_meteo"] is not None:
+        # > 0: Open-Meteo is closer to the real station than the nearest other station is.
+        row["open_meteo_mae_gain_vs_nearest_C"] = round(row["mae_C_nearest"] - row["mae_C_open_meteo"], 2)
+    else:
+        row["open_meteo_mae_gain_vs_nearest_C"] = None
+    return row
+
+
+def summarize_by_distance(rows: list[dict]) -> list[dict]:
+    """Average MAE per method for stations grouped by distance to their nearest neighbor.
+
+    This answers "past what distance should we trust Open-Meteo over the nearest station?"
+    Groups with no stations are left out. Few stations per group = weak evidence; n is reported.
+    """
+    out = []
+    edges = DISTANCE_BINS_KM
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        group = [r for r in rows if r["nearest_dist_km"] is not None and lo <= r["nearest_dist_km"] < hi]
+        if not group:
+            continue
+        entry = {"dist_km": f"{lo:g}-{hi:g}" if hi != float("inf") else f"{lo:g}+", "n_stations": len(group)}
+        for name in METHODS:
+            vals = [r[f"mae_C_{name}"] for r in group if r[f"mae_C_{name}"] is not None]
+            entry[f"mean_mae_C_{name}"] = round(float(np.mean(vals)), 2) if vals else None
+        entry["open_meteo_beats_nearest"] = sum(
+            1 for r in group if (r["open_meteo_mae_gain_vs_nearest_C"] or 0) > 0)
+        out.append(entry)
+    return out

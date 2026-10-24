@@ -53,3 +53,41 @@ def test_validate_scores_three_methods_on_same_hours():
     assert c["best_method_by_mae"] in ("nearest", "idw", "open_meteo")
     # the synthetic model is built 1 °F warm; validation should see that bias
     assert 0.5 < c["methods"]["open_meteo"]["bias_F"] < 1.5
+
+
+def test_summarize_by_distance_groups_and_counts():
+    rows = [
+        {"nearest_dist_km": 5.0, "mae_C_nearest": 0.5, "mae_C_idw": 0.6, "mae_C_open_meteo": 1.0,
+         "open_meteo_mae_gain_vs_nearest_C": -0.5},
+        {"nearest_dist_km": 40.0, "mae_C_nearest": 2.0, "mae_C_idw": 1.5, "mae_C_open_meteo": 1.2,
+         "open_meteo_mae_gain_vs_nearest_C": 0.8},
+    ]
+    groups = source_compare.summarize_by_distance(rows)
+    assert [g["dist_km"] for g in groups] == ["0-15", "30-50"]
+    assert groups[0]["open_meteo_beats_nearest"] == 0
+    assert groups[1]["open_meteo_beats_nearest"] == 1
+    assert groups[1]["mean_mae_C_open_meteo"] == 1.2
+
+
+def test_validate_all_synthetic():
+    r = client.get("/validate/all", params={"as_of": "2025-02-28", "radius_km": 1000})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["stations_compared"] >= 5
+    assert "12" not in [s["station_id"] for s in body["stations"]]  # inactive, not a target by default
+    assert sum(g["n_stations"] for g in body["by_nearest_distance"]) == body["stations_compared"]
+
+
+def test_neighbor_without_data_is_skipped():
+    """A closed station near the target must not be picked as 'nearest'."""
+    from app import data
+    stations = data.get_stations()
+    start, end = date(2024, 11, 1), date(2024, 12, 31)
+    hourly = {s: data.get_hourly(s, start, end).set_index("datetime")["temp_F"]
+              for s in stations["station_id"]}
+    first = source_compare.compare_methods(stations, hourly, "SYN-B", start, end)
+    closest = first["methods"]["nearest"]["station"]["station_id"]
+    hourly[closest] = pd.Series(dtype=float)  # pretend it closed
+    second = source_compare.compare_methods(stations, hourly, "SYN-B", start, end)
+    assert second["methods"]["nearest"]["station"]["station_id"] != closest
+    assert second["methods"]["idw"]["available"] is True
