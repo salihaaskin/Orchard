@@ -68,6 +68,8 @@ backend/   FastAPI
   app/chill.py     chill hours, Utah units, chill portions (Dynamic Model), GDD
   app/interp.py    estimate at any point: IDW + elevation lapse rate; leave-one-out
   app/forecast.py  Open-Meteo 14-day forecast, cached for offline demos
+  app/openmeteo_hist.py  Open-Meteo past hourly temperatures (ERA5-Land), cached
+  app/source_compare.py  scores nearest station vs IDW vs Open-Meteo against a real station
   app/seasons.py   season windows (chill from Nov 1, GDD from Mar 1)
   app/main.py      API: /estimate, /validate, /stations, /demo, /health
   app/config.py    all shared settings — change values here, not in code
@@ -77,7 +79,7 @@ data/cache/  cached station data (git-ignored, shared into Docker as a volume)
 | Endpoint | What it answers |
 | --- | --- |
 | `GET /estimate?lat=&lon=&as_of=&crop=&exclude=` | Questions 1–3 for any point |
-| `GET /validate?station_id=&as_of=` | Hide a station, estimate it, report error with and without the elevation adjustment |
+| `GET /validate?station_id=&as_of=` | Hide a station, estimate it, report error with and without the elevation adjustment; `method_comparison` scores nearest station vs IDW vs Open-Meteo (MAE, RMSE, bias, % within ±2 °C, chill/GDD error) on the same hours |
 
 ## Data contract
 
@@ -111,4 +113,4 @@ Every stage reads and writes one hourly table:
 
 ## Data and credits
 
-CIMIS (California Department of Water Resources) · Open-Meteo (forecast and elevation; Copernicus DEM) · chill models as described by UC Davis FNRIC · Dynamic Model after Fishman et al. (1987) and Erez et al. (1990), following chillR (Luedeling).
+CIMIS (California Department of Water Resources) · Open-Meteo (forecast, elevation, and Historical Weather API; Copernicus DEM; ERA5-Land, contains modified Copernicus Climate Change Service information) · chill models as described by UC Davis FNRIC · Dynamic Model after Fishman et al. (1987) and Erez et al. (1990), following chillR (Luedeling).

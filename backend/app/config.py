@@ -41,6 +41,12 @@ IDW_POWER = float(os.getenv("IDW_POWER", 2.0))
 # Winter valley inversions can make this wrong; validation decides the value we ship.
 LAPSE_F_PER_M = float(os.getenv("LAPSE_F_PER_M", 0.0117))
 
+# Open-Meteo Historical API model we test as a stand-in for a station (validation).
+# era5_land: ~9 km grid, consistent back to 1950, about 5 days behind real time.
+OPENMETEO_MODEL = os.getenv("OPENMETEO_MODEL", "era5_land")
+# Validation reports the share of hours an estimate lands within this many °C of the station.
+WITHIN_C = 2.0
+
 # Gaps up to this many hours are filled by linear interpolation; longer gaps stay missing.
 MAX_FILL_HOURS = 3
 

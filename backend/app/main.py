@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 
-from . import chill, config, data, forecast, interp, seasons
+from . import chill, config, data, forecast, interp, seasons, source_compare
 
 app = FastAPI(title="Chill at My Orchard", version="0.1.0")
 METRICS = ("chill_portions", "chill_hours", "hours_lt_45", "utah_units")
@@ -167,7 +167,10 @@ def estimate(
 
 @app.get("/validate")
 def validate(station_id: str, as_of: date = Query(default=date(2025, 2, 28))):
-    """Hide a station; estimate it from neighbors with and without the elevation adjustment."""
+    """Hide a station; estimate it from neighbors with and without the elevation adjustment.
+
+    method_comparison also scores nearest station vs IDW vs Open-Meteo on the same hours.
+    """
     stations_df = data.get_stations()
     if station_id not in set(stations_df["station_id"]):
         raise HTTPException(404, f"Unknown station {station_id}")
@@ -180,6 +183,8 @@ def validate(station_id: str, as_of: date = Query(default=date(2025, 2, 28))):
     summarize = lambda s: chill.summarize(s)  # noqa: E731
     with_elev = interp.leave_one_out(stations_df, hourly, station_id, summarize)
     no_elev = interp.leave_one_out(stations_df, hourly, station_id, summarize, lapse_f_per_m=0.0)
+    comparison = source_compare.compare_methods(stations_df, hourly, station_id, c_start, c_end)
     return {"season": f"{c_start} to {c_end}", "with_elevation_adjustment": with_elev,
-            "no_elevation_adjustment": no_elev, "data_source": config.DATA_SOURCE,
+            "no_elevation_adjustment": no_elev, "method_comparison": comparison,
+            "data_source": config.DATA_SOURCE,
             "generated": datetime.now().isoformat(timespec="seconds")}
